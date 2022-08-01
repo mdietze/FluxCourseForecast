@@ -41,6 +41,8 @@ SSEM.orig <- function(X, params, inputs, timestep = 1800){
                Rh = Rh, litterfall = litterfall, mortality = mortality))
   
 }
+SSEM <- cmpfun(SSEM.orig)  ## byte compile the function to make it faster
+
 
 ##` @param X       Initial Conditions [leaf carbon, wood carbon, soil organic carbon] (units=Mg/ha)
 ##` @param params   model parameters

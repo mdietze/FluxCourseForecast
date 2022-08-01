@@ -77,7 +77,6 @@ sensitivity. Finally, Normal process error is added to X.
 
 ```{r}
 SSEM.orig
-SSEM <- cmpfun(SSEM.orig)  ## byte compile the function to make it faster
 ```
 
 # Initial Conditions
@@ -234,6 +233,16 @@ output.ensemble = ensemble_forecast(X = X.orig,
 plot_forecast(output.ensemble,sample=5)
 ```
 
+If you like Ensemble Forecasting, you may also like...
+
+* Alternative approaches to error propagation
+  * Analytical distributional transformations
+  * Analytical Moments
+  * Linear Tangent approximations
+* Uncertainty partitioning
+* Predictability analyses (e.g. error vs lead time)
+* Dietze 2017 Prediction in ecology: a first-principles framework. Ecological Applications 27: 2048–2060. DOI: 10.1002/eap.1589
+
 # Assessment
 
 At the half-hourly or hourly resolution, the _QC variable indicates if the corresponding record is a measured value (_QC = 0) or the quality level of the gap-filling that was used for that record (_QC = 1, _QC = 3 worse quality).
@@ -298,9 +307,10 @@ If you liked the Particle Filter, you may also like...
   * JAGS, NIMBLE
   * R's BayesianTools
 * Hamiltonian Monte Carlo & STAN
+* State Space Models
 * Kalman Filter
 * Ensemble Kalman Filter
-* Using uncertainty analysis (Sobol, Monte Carlo, etc) to reduce the numnber of parameters considered
+* Using uncertainty analysis (Sobol, Monte Carlo, etc) to reduce the number of parameters considered
 
 
 # Workflow
@@ -338,6 +348,9 @@ for(t in 1:ndays){
   # counter to help us know things are still running
   print(t)
 }
+
+## Save the Analysis
+saveRDS(Analysis,file="Analysis.RDS")
 
 ## effective sample size over time
 weights = sapply(Analysis,function(x){x$wt})
@@ -538,25 +551,7 @@ aws.s3::put_object(object = meta_file, bucket = "submissions")
 # Next steps
 
 * Run the forecast into the future using forecast meteorology (EFI provides NOAA GEFS 35 day, 31 ensemble)
-```{r}
-Sys.unsetenv("AWS_DEFAULT_REGION")
-Sys.unsetenv("AWS_S3_ENDPOINT")
-Sys.setenv(AWS_EC2_METADATA_DISABLED="TRUE")
-s3 <- arrow::s3_bucket("drivers/noaa/neon/gefs", 
-                       endpoint_override =  "js2.jetstream-cloud.org:8001",
-                       anonymous=TRUE)
-df <- arrow::open_dataset(s3)
-dc <- df %>% 
-  filter(site_id == "NIWO",start_time >= as.Date("2022-07-01"), variable %in% c("TMP","DSWRF")) %>%
-  collect()
-met <- dc %>% filter(start_time == as.Date("2022-07-01 00:00:00")) %>% pivot_wider(names_from = ensemble,values_from = predicted)
-PAR = met %>% filter(variable == "DSWRF") 
-inputs <- list(
-  date = PAR$time,
-  temp = temp = met %>% filter(variable == "TMP") %>% head(-1) %>% select(-(1:9)) %>% t(), ## air temperature (Celsius)
-  PAR  = as.matrix(t(PAR[,-(1:9)])) / 0.486 ## gap filled PAR, conversion From Campbell and Norman p151
-)
-```
+
 Note that met variables are now matrices of ensemble members that need to be sampled over!
 
 * Automate to run every day!
