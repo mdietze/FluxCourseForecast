@@ -1,0 +1,736 @@
+---
+title: "Carbon Forecast"
+author: "Flux Course 2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(compiler)
+library(tidyverse)
+library(mvtnorm)
+library(EML)
+#remotes::install_github("ecoforecast/ecoforecastR")
+library(ecoforecastR)
+#remotes::install_github("eco4cast/EFIstandards")
+#library(EFIstandards)
+
+## configuration
+
+#### SET THE ENSEMBLE SIZE
+ne = 500 ## production run should be 200 - 5000, depending on what your computer can handle
+
+timestep = 1800 #seconds
+
+start_date = as.Date("2015-07-01")
+horiz_calib = 1  #day   forecast horizon during calibration
+horiz       = 35 #days, forecast horizon during forecast
+
+outdir = "./" ## output directory for saving files
+
+indir = "~/Google Drive/Teaching/FluxCourseForecast2022/" ## input directory for reading training data
+## this folder is available at https://bit.ly/3POkhq9
+```
+
+# Why Forecast
+
+* Accelerate Science
+* Improve Decision Making
+
+
+# What: NEON Forecast Challenge Flux Forecast
+
+* 35 days ahead (NOAA GEFS ensemble weather forecast)
+* subdaily timestep
+* NEON fluxes updated daily (5 day latency)
+* Able to submit daily
+
+More info is available at https://ecoforecast.org/efi-rcn-forecast-challenges/
+ 
+# How: Forecast Analysis Cycle
+
+* Forecast step -> Uncertainty propagation
+* Analysis step -> Bayes' theorem
+  
+# Super Simple Ecosystem Model
+
+Let's begin by defining our model itself, as well as a number of ancillary 
+functions that will be useful in simulation and analysis. The model below is 
+very simple but is complex enough to have some chance at capturing observed 
+variability. In addition, unlike most ecosystem models, it explicitly contains 
+process error. The model has three state variables (X) that are all expressed in
+terms of carbon (Mg/ha): Leaf Biomass, Structural Biomass (wood, roots, etc),
+and soil organic matter (SOM). The model also has only two drivers: 
+photosynthetically active radiation (PAR), and air temperature. Within the model we first 
+estimate LAI from Leaf Biomass and SLA. Using LAI and light we estimate GPP 
+using a simple light use efficiency approach. GPP is then allocated to 
+autotrophic respiration (Ra), leaf NPP, and woody NPP. These leaf and wood 
+biomass pools can then turns over into SOM as litterfall and Coarse Woody Debris / mortality. 
+Heterotrophic respiration is assumed to follow a standard Q10 temperature 
+sensitivity. Finally, Normal process error is added to X.
+
+```{r}
+##` Super Simple Ecosystem Model
+##` @param X        [leaf carbon, wood carbon, soil organic carbon] (units=Mg/ha)
+##` @param params   model parameters
+##` @param inputs   model drivers (air temperature, PAR)
+##` @param timestep seconds, defaults to 30 min
+SSEM.orig <- function(X, params, inputs, timestep = 1800){ 
+  
+  ne = nrow(X)  ## ne = number of ensemble members
+  
+  ##Unit Converstion: umol/m2/sec to Mg/ha/timestep
+  k = 1e-6 * 12 * 1e-6 * 10000 * timestep #mol/umol*gC/mol*Mg/g*m2/ha*sec/timestep
+
+  ## photosynthesis
+  LAI = X[, 1] * params$SLA * 0.1  #0.1 is conversion from Mg/ha to kg/m2
+  if(inputs$PAR > 1e-20){
+      GPP = pmax(0, params$alpha * (1 - exp(-0.5 * LAI)) * inputs$PAR)
+  } else {
+      GPP = rep(0, ne)
+  }
+  
+  ## respiration & allocation
+  alloc = GPP *   params[,c("falloc.1","falloc.2","falloc.3")] ## Ra, NPPwood, NPPleaf
+  Rh = pmax(params$Rbasal * X[, 3] * params$Q10 ^ (inputs$temp / 10), 0) ## pmax ensures SOM never goes negative
+  
+  ## turnover
+  litterfall = X[, 1] * params$litterfall
+  mortality = X[, 2] * params$mortality
+  
+  ## update states
+  X1 = pmax(rnorm(ne, X[, 1] + alloc[, 3] * k - litterfall, params$sigma.leaf), 0)
+  X2 = pmax(rnorm(ne, X[, 2] + alloc[, 2] * k - mortality, params$sigma.stem), 0)
+  X3 = pmax(rnorm(ne, X[, 3] + litterfall + mortality - Rh * k, params$sigma.soil), 0)
+  
+  return(cbind(X1 = X1, X2 = X2, X3 = X3,
+               LAI = X1 * params$SLA * 0.1, 
+               GPP = GPP,
+               NEP = GPP - alloc[, 1] - Rh,
+               Ra = alloc[, 1], NPPw = alloc[, 2], NPPl = alloc[, 3],
+               Rh = Rh, litterfall = litterfall, mortality = mortality))
+  
+}
+SSEM <- cmpfun(SSEM.orig)  ## byte compile the function to make it faster
+```
+
+# Initial Conditions
+
+Having defined our model, the next step is to define the ensemble size and 
+generate an ensemble estimate of the initial state variables. To do so we'll use
+the estimates that are reported in the Ameriflux BADM Meta-data files for the 
+site. Since we're only relying on two different estimates of pool size to 
+calculate our mean and standard deviation, and neither estimate has a reported 
+error, these should be taken as "demonstration only" rather than as 
+"Best practices". In a real application one would want to account for the 
+sampling error associated with the number of vegetation plots or soil cores 
+measured, the measurement error in the soil C and tree DBH, and the allometric 
+uncertainty in converting from DBH to leaf and stem biomass. In other words, our
+pool sizes are likely a lot less certain than what we take them to be in this 
+exercise.
+
+There are a few assumptions in developing the initial conditions
+- The mean and standard deviation are only calculated using two observations. 
+  As stated above, this is not best practice.
+- The wood state is the combination of stems, coarse roots, and fine roots
+- The SOM (soil) state is the combination of litter, downed coarse woody debris,
+  and soil.
+- All values are converted from g/m2 to Mg/ha
+
+```{r}
+### Initial State (Mg/ha)
+### These specific data points were extracted from the US-NR1 Ameriflux BADM files
+### https://ameriflux.lbl.gov/sites/siteinfo/US-NR1
+### METADATA: https://ameriflux.lbl.gov/data/badm/badm-standards/ 
+#library(readxl)
+#badm = readxl::read_xlsx(file.path(indir,"AMF_AA-Flx_FLUXNET-BIF_CCBY4_20220606.xlsx")) %>% filter(SITE_ID == "US-NR1")
+#Bwood = badm %>% filter(VARIABLE == "AG_BIOMASS_TREE") %>% select(DATAVALUE) %>% type_convert() ## unsuccessful crack at automating extraction
+Bwood = 14500 * 1e-6 * 10000 ## convert g/m2 -> Mg/ha
+Bleaf = 2950 * 0.01  ## generates a LAI that is too high ***
+SOM = c(1.57, 1.58) + c(0.49, 1.39) + c(2.06, 2.59) * 1e-3 * 10000 ## sum up litter, CWD, and soil; change units (US-ME2)
+X = as.matrix(c(mean(Bleaf), mean(Bwood), mean(SOM)))
+### sample initial condition ensemble members
+if(ne > 1){
+  X = as.matrix(cbind(
+      rnorm(ne, X[1], Bleaf*0.1), ## no variability in data, assume 10%
+      rnorm(ne, X[2], Bwood*0.1), ## no variability in data, assume 10%
+      rnorm(ne, X[3], sd(SOM))))
+}
+X.orig = X ## make a copy so that we can run different experiments
+
+## visualize initial condition priors
+pool.lab = c("leaf", "wood", "SOM")
+for(i in 1:3){
+  hist(X[, i], main = pool.lab[i])
+}
+```
+
+# Drivers
+```{r}
+flux <- read_csv(file.path(indir,"AMF_US-NR1_FLUXNET_FULLSET_1998-2016_3-5","AMF_US-NR1_FLUXNET_FULLSET_HH_1998-2016_3-5.csv"))
+date = strptime(flux$TIMESTAMP_START,format="%Y%m%d%H%M")
+
+inputs <- data.frame(
+  date = date,
+  temp = flux$TA_ERA, ## gap filled air temperature (Celsius)
+  PAR  = flux$SW_IN_ERA / 0.486 ## gap filled PAR, conversion From Campbell and Norman p151
+)
+plot(inputs$date,inputs$PAR,type='l')
+plot(inputs$date,inputs$temp,type='l')
+```
+
+# Parameters: Priors & Direct constraints (trait data)
+
+```{r}
+## ancillary data from Ameriflux BADM metadata
+SLA = 1e3/c(193.7,205.1,237.7)     ## m2/kg
+litterfall = c(215.8)*0.01*3 ## gC/m2/yr->Mg/ha/yr
+
+### initial params
+params = list()
+
+## univariate priors: expert opinion
+params$alpha = rlnorm(ne, log(0.02), 0.05)     ## light use efficiency
+params$Q10 = rnorm(ne, 2.1, 0.1)               ## soil respiration Q10
+params$Rbasal = rlnorm(ne, log(0.2), 1) / (params$Q10^2.5) ## Soil basal respiration (umol/m2/sec per Mg/ha of SOM)
+
+## multivariate prior on allocation parameters
+## assume that NPP is ~50% of GPP on average (Litton et al 2007)
+Ra = 0.5                                    
+## prior mean on allocation, assume leaf NPP is 31.5% of total (Quaife et al 2008)
+alloc = matrix(c(Ra, (1 - 0.315) * (1 - Ra), 0.315 * (1 - Ra)), 1) 
+## draw effective sample size to add stochasticity to prior
+Neff = matrix(rpois(ne, 100), ne)
+## reimplimentation of the rdirichlet function from MCMCpack
+## to fix bug in how it handles alpha as a matrix
+rdirichlet.orig = function (n, alpha) 
+{
+    l <- length(alpha)
+    if(is.matrix(alpha)) l <- ncol(alpha)
+    x <- matrix(rgamma(l * n, alpha), ncol = l)
+    sm <- x %*% rep(1, l)
+    return(x/as.vector(sm))
+}
+rdirichlet <- cmpfun(rdirichlet.orig)         ## byte compile to speed up
+## prior on fractional allocation to [Ra, wood, leaf] (each draw must sum to 1)
+params$falloc = rdirichlet(ne,Neff%*%alloc) 
+
+## Process error: expert opinion
+## convert gamma priors on precision into standard deviations
+params$sigma.leaf = 1 / sqrt(rgamma(ne, 10, 10 * 0.01 ^ 2)) ## leaf biomass
+params$sigma.stem = 1 / sqrt(rgamma(ne, 10, 10 * 0.01 ^ 2)) ## wood biomass
+params$sigma.soil = 1 / sqrt(rgamma(ne, 10, 10 * 0.01 ^ 2)) ## soil carbon
+
+## Specific leaf area
+params$SLA = rnorm(ne, mean(SLA), sd(SLA)) 
+
+## moment matching beta prior on turnover times
+beta.match <- function(mu, var){   ## Beta distribution moment matching
+  a = mu * ((mu * (1 - mu) / var) - 1)
+  b = a * (1 - mu) / mu
+  return(data.frame(a = a, b = b))
+}
+
+## simulate litterfall turnover based on observed 
+## litterfall rate and Bleaf prior (initial condition)
+if(length(litterfall)>1){
+  sdlitterfall = sd(litterfall)
+} else {
+  sdlitterfall = 0.1*litterfall ## wild assumption
+}
+lit = rnorm(10000,mean(litterfall),sdlitterfall/sqrt(2))/     
+  rnorm(10000,mean(X[,1]),sd(X[,1])/sqrt(2))     ## X1 = leaf biomass 
+## draw prior mean and sd; convert turnover per year -> turnover per timestep
+lit.mu = rnorm(ne,mean(lit),sd(lit))*timestep/86400/365  
+lit.sd = 1/sqrt(rgamma(ne,10,10*var(lit)))*timestep/86400/365
+litterfall.param = beta.match(lit.mu,lit.sd^2)
+## match moments and draw litterfall prior
+params$litterfall = rbeta(ne,litterfall.param$a,litterfall.param$b) 
+
+## draw prior mean based on background tree mortality rate of 1/142 per year (Dietze et al 2011)
+mortality.mu = 1/rpois(ne,142)*timestep/86400/365             
+## draw prior sd assuming a 50% CV
+mortality.sd = rbeta(ne,4,4)*mortality.mu*timestep/86400/365         
+## match moments and draw mortality prior
+mortality.param = beta.match(mortality.mu,mortality.sd^2)
+params$mortality = rbeta(ne,mortality.param$a,mortality.param$b)  
+
+## flatten to a data frame
+params = as.data.frame(params)
+```
+
+### plot parameter values
+```{r, echo=FALSE}
+plot_params <- function(params, hist.params = NULL){
+  par(mfrow=c(5,3))                ## 5 x 3 grid of plots
+  par(mar=c(2,2,4,0.7))            ## make plot margins smaller
+  for(i in 1:ncol(params)){      ## loop over parameters
+    new = density(params[,i])                 ## parameter density at end of PF
+    if(is.null(hist.params)){
+      ylim=range(new$y)
+      plot(new,main=names(params)[i],xlab=" ",
+           ylim=ylim)
+      text(max(new$x),ylim[2]*0.9,
+           paste(format(mean(params[[i]]),digits=3), ## write the mean and SD onto the figure
+                 format(sd(params[[i]]),digits=3)),
+           pos=2,col=2)
+     
+    } else {
+      orig = density(hist.params[,i])      ## parameter density at start of PF
+      ylim=range(c(range(new$y),range(orig$y)))
+      plot(orig,main=names(params)[i],xlab=" ",
+           ylim=ylim)
+      lines(new,col=2,lwd=2)
+      text(max(orig$x),ylim[2],
+           paste("Prior",format(mean(hist.params[,i]),digits=3), ## write the mean and SD onto the figure
+                 format(sd(hist.params[,i]),digits=3)),
+           pos=2)
+      text(max(orig$x),ylim[2]*0.9,
+           paste("Final timestep:",format(mean(params[[i]]),digits=3), ## write the mean and SD onto the figure
+                 format(sd(params[[i]]),digits=3)),
+           pos=2,col=2)
+    }
+  }
+}
+```
+
+```{r, fig.asp=1}
+plot_params(params)
+```
+
+# Forecast Step: Monte Carlo Error Propagation
+
+*Define forecast function*
+```{r}
+##` @param X       Initial Conditions [leaf carbon, wood carbon, soil organic carbon] (units=Mg/ha)
+##` @param params   model parameters
+##` @param inputs   model drivers (air temperature, PAR)
+ensemble_forecast <- function(X,params,inputs){
+  nt = nrow(inputs)
+  output = array(0.0, c(nt, ne, 12))     ## output storage [time step,ensembles,variables]
+  
+  ## forward ensemble simulation
+  for(t in 1:nt){
+    output[t, , ] <- SSEM(X, params, inputs[t, ])  ## run model, save output
+    X <- output[t, , 1:3]                          ## set most recent prediction to be the next IC
+    if((t %% 336) == 0) print(t / 336)             ## counter: weeks elapsed (7*48 = 1 week)
+  }
+  output[is.nan(output)] = 0
+  output[is.infinite(output)] = 0
+  return(output) 
+}
+```
+
+*Run first forecast*
+```{r}
+dayInputs = inputs %>% filter(date >= start_date, date < start_date + horiz_calib)
+output.ensemble = ensemble_forecast(X = X.orig,
+                                    params = params,
+                                    inputs = dayInputs) 
+```
+
+```{r}
+## Basic time-series visualizations
+varnames <- c("Bleaf","Bwood","BSOM","LAI","GPP","NEP","Ra",
+              "NPPw","NPPl","Rh","litterfall","mortality")
+units <- c("Mg/ha","Mg/ha","Mg/ha","m2/m2","umol/m2/sec","umol/m2/sec",
+           "umol/m2/sec","umol/m2/sec","umol/m2/sec","umol/m2/sec",
+           "Mg/ha/timestep","Mg/ha/timestep")
+plot_forecast <- function(out,sample=FALSE){
+  if(sample){
+    samp = sample.int(dim(out)[2],sample)
+  } 
+  for(i in 1:12){  ## loop over variables
+    ci = apply(out[, , i], 1, quantile, c(0.025, 0.5, 0.975))   ## calculate CI over ensemble members
+    plot(ci[2, ], main = varnames[i], 
+         xlab = "time", ylab = units[i], type='l',ylim  =range(ci))
+    ciEnvelope(1:ncol(ci), ci[1, ], ci[3, ], col = col.alpha("lightGrey", 0.5)) ## plot interval
+    lines(ci[2, ])   ## plot median
+    if(sample){
+      for(j in seq_len(sample)){
+        lines(out[,j,i],lty=2)
+      }
+    }
+  }
+}
+plot_forecast(output.ensemble,sample=5)
+```
+
+
+
+# Assessment
+
+At the half-hourly or hourly resolution, the _QC variable indicates if the corresponding record is a measured value (_QC = 0) or the quality level of the gap-filling that was used for that record (_QC = 1, _QC = 3 worse quality).
+```{r}
+## model
+ci = apply(output.ensemble[, ,6], 1, quantile, c(0.025, 0.5, 0.975)) ## forecast confidence interval
+                                                                     ## variable 6 = NEP
+## observations
+today = which(date >= start_date & date < start_date + horiz_calib)
+nep = -flux$NEE_VUT_REF[today] ## change sign convention
+nep.qc = flux$NEE_VUT_REF_QC[today]
+nep.unc = flux$NEE_VUT_REF_JOINTUNC[today]
+
+## plot timeseries
+ylim = range(c(range(ci),range(nep,na.rm=TRUE)))
+plot(dayInputs$date,ci[2,],ylim=ylim,col=1,pch=18)
+ciEnvelope(dayInputs$date, ci[1, ], ci[3, ], col = col.alpha("lightGrey", 0.5))
+points(dayInputs$date,nep,col=nep.qc+1)
+legend("topright",legend=c("model",paste("QC",0:2)),
+       pch = c(18,rep(1,3)),
+       col=  c(1,1:3))
+
+## predicted/observed plot
+plot(ci[2,],nep,col=nep.qc+1)
+abline(0,1,lty=2)
+```
+
+
+# Analysis Step: Particle Filter
+
+* What is a Likelihood?
+* What is Bayes Theorem?
+* How does it allow us to update model parameters and states?
+* How does a Particle Filter work?
+
+```{r}
+##` Kernel density smoother of parameter values
+##` @param  params  data.frame of model parameters
+##` @param  h       smoothing weight (1 = no smoothing, 0 = iid redraw based on mean and cov)
+smooth.params <- function(params,h=1){
+  params.star = params
+  thetaBar = colMeans(params)
+  SIGMA = cov(params)
+  epsilon = rmvnorm(ne,rep(0,ncol(params)),SIGMA) ## propose deviations
+  ## Kernel Smooth each row
+  for(i in 1:nrow(params.star)){
+    params.star[i,] = thetaBar + h*(params[i,] - thetaBar) + epsilon[i,]*sqrt(1-h^2)
+  }
+  ## enforce constraints
+  params.star[params.star < 0] = 0
+  falloc = params.star[,c("falloc.1","falloc.2","falloc.3")]
+  falloc = falloc / rowSums(falloc)  ## fractional allocation needs to sum to 1
+  params.star[,c("falloc.1","falloc.2","falloc.3")] = falloc
+  return(params.star)
+}
+
+##` Particile filter
+##` Updates state and parameter weights based on likelihood of the data
+##` Will resample-move if effective sample size drops to <50%
+##`
+##` @param out    ensemble forecast output (matrix)
+##` @param params model parameters (matrix)
+##` @param dat    data mean and uncertainty (data.frame)
+##` @param wt     prior ensemble weight (vector)
+ParticleFilter <- function(out,params,dat,wt=1){
+  
+  ## grab current state variables (last time step)
+  X = out[dim(out)[1], , 1:3]
+  
+  if(sum(!is.na(dat$nep)) == 0){ ## if there's no data, Analysis = Forecast
+    return(list(params=params,X=X, wt=wt))
+  }
+  
+  ## calculate the cumulative likelihoods to be used as PF weights
+  like = rep(NA,ne)
+  for(i in 1:ne){
+    like[i] = exp(sum(dnorm(dat$nep, out[,i,6], dat$sigma.nep, log = TRUE),na.rm = TRUE))  ## calculate log likelihoods
+  }
+  wt = like * wt ## update weights
+
+  ## hist(wt,main="Ensemble Weights")  ## useful diagnostic if you're running line-by-line
+  
+  ## calculate effective sample size
+  wtn = wt/sum(wt)          ## normalized weights
+  Neff = 1/sum(wtn^2)
+  
+  ## check if effective size has dropped below 50% threshold
+  if(Neff < ne/2){
+    ## resample ensemble members in proportion to their weight
+    index = sample.int(ne, ne, replace = TRUE, prob = wtn) 
+    X = X[index, ]                                ## update state
+    params = smooth.params(params[index,],h=0.95) ## kernel smooth updated parameters
+    wt = rep(1,ne)                                ## if resample, reset weights
+  }
+  return(list(params=params,X=X, wt=wt))  ## analysis updates parameters, state, and weights
+  
+}
+```
+
+
+```{r}
+Analysis = list() ## storage for saving PF output
+
+## data constraints, day 1
+nep[nep.qc>0] = NA                   ## only use true observations, not gap-filled values
+dat = data.frame(nep = nep,
+                 sigma.nep = nep.unc
+                )
+## run PF
+Analysis[[1]] = ParticleFilter(output.ensemble,params,dat,wt = rep(1,ne))
+
+```
+
+# Workflow
+
+Now let's put the Forecast and Analysis steps into an iterative cycle so that we can calibrate the model
+
+```{r}
+ndays = 30                                              ## number of days to run the forecast
+
+t0 = which(date == start_date)                          ## row number of time 0 
+forecast <- array(NA,c(86400/timestep*(ndays+1),ne,12)) ## output storage [time, ensemble, state]
+forecast[1:dim(output.ensemble)[1],,] = output.ensemble ## store first forecast
+
+for(t in 1:ndays){
+  
+  today = which(date >= (start_date + t) & date < (start_date + horiz_calib + t))
+  
+  # Today's forecast
+  out = ensemble_forecast(X = Analysis[[t]]$X,           ## initial conditions = yesterday's Analysis
+                          params = Analysis[[t]]$params, ## today's parameters = yesterday's Analysis
+                          inputs = inputs[today,])       ## today's subset of meteorology     
+  forecast[today-t0+1,,] = out                           ## store today's forecast in overall array
+  
+  # Today's data constraints
+  nep = -flux$NEE_VUT_REF[today]
+  nep.qc = flux$NEE_VUT_REF_QC[today]
+  nep[nep.qc>0] = NA
+  dat = data.frame(nep = nep,
+                   sigma.nep = flux$NEE_VUT_REF_JOINTUNC[today]
+                  )
+  
+  # Today's analysis
+  Analysis[[t+1]] = ParticleFilter(out,Analysis[[t]]$params, dat,wt = Analysis[[t]]$wt)
+  
+  # counter to help us know things are still running
+  print(t)
+}
+
+## effective sample size over time
+weights = sapply(Analysis,function(x){x$wt})
+Neff = apply(weights,2,function(x){
+  wtn = x/sum(x)
+  return(1/sum(wtn^2))})
+plot(Neff,type='l')
+abline(v=which(Neff > 0.999*ne),lty=3)
+```
+
+# Forecast Visualizations
+
+Timeseries for all variables
+```{r}
+plot_forecast(forecast)
+```
+
+
+Validation against NEP
+```{r}
+## Timeseries
+days = which(date >= start_date & date < start_date + horiz_calib + ndays)
+nep = -flux$NEE_VUT_REF[days]
+nep.qc = flux$NEE_VUT_REF_QC[days]
+ci = apply(forecast[, ,6], 1, quantile, c(0.025, 0.5, 0.975))
+ylim = range(c(range(ci),range(nep,na.rm=TRUE)))
+plot(date[days],ci[2,],ylim=ylim,col=1, pch=18,ylab="NEP",type="b")
+#ciEnvelope(date[days], ci[1, ], ci[3, ], col = col.alpha("lightGrey", 0.5))
+points(date[days],nep,col=nep.qc+1)
+legend("topright",legend=c("model",paste("QC",0:2)),
+       pch = c(18,rep(1,3)),
+       col=  c(1,1:3))
+## predicted/observed
+plot(ci[2,],nep,col=nep.qc+1,xlab="model")
+abline(0,1,lty=2)
+
+```
+
+Compare initial and final parameters
+```{r,fig.asp=1}
+plot_params(Analysis[[t+1]]$params,params)
+```
+
+
+How did parameters evolve over time?
+```{r}
+## parameter timeseries
+for(i in 1:12){
+  p = sapply(Analysis,function(x){
+    wtd.quantile(x$params[,i],x$wt,c(0.025,0.5,0.975))
+  })
+  time = start_date + 0:ndays
+  
+  plot(time,p[2,],ylim=range(p),ylab=names(params)[i])
+  ciEnvelope(time,p[1,],p[3,],col=col.alpha("lightblue",0.5))
+}
+```
+
+
+# EFI Standard: output and metadata
+
+To be able to submit the forecast to the NEON challenge, we need to reorganize the output into community standard (long data frame) and generate metadata about the forecast
+
+```{r}
+## reorganize data in long format
+dimnames(output.ensemble) <- list(as.character(date[today]),as.character(1:ne),varnames) ## label array dimensions
+fx = as.data.frame.table(output.ensemble)                                       ## reorganize into long foremat
+colnames(fx) = c("time","ensemble","variable","prediction")                     ## label columns
+fx_file = file.path(outdir,paste0("terrestrial_30min_",start_date,"_SSEM.csv")) ## output filename
+write_csv(fx,fx_file)
+head(fx)
+
+## metadata
+
+## define variable names, units, etc
+attributes <- tibble::tribble(
+ ~attributeName,     ~attributeDefinition,                          ~unit,                  ~formatString, ~numberType, ~definition,
+ "time",              "[dimension]{time}",                          "year",                 "YYYY-MM-DD HH:MM:SS",  "numberType", NA,
+ "ensemble",          "[dimension]{index of ensemble member}",      "dimensionless",         NA,           "integer",    NA,
+) 
+variables = cbind(varnames,rep("[variable]",12),units,rep(NA,12),rep("real",12),rep(NA,12))
+colnames(variables) = colnames(attributes)
+attributes <- rbind(attributes,variables)
+attributes
+attrList <- set_attributes(attributes, 
+                           col_classes = c("Date", "numeric", rep("numeric",nrow(variables))))
+
+## sets metadata about the file itself (name, file type, size, MD5, etc)
+physical <- set_physical(fx_file, recordDelimiter='\n')
+
+## set metadata for the file as a whole
+dataTable <- eml$dataTable(
+                 entityName = "forecast",  ## this is a standard name 
+                 entityDescription = "Carbon cycle forecast for US-NR1",
+                 physical = physical,
+                 attributeList = attrList)
+
+me <- list(individualName = list(givenName = "Mike", 
+                                 surName = "Dietze"),
+           electronicMailAddress = "dietze@bu.edu",
+           id = "https://orcid.org/0000-0002-2324-2518")
+
+coverage <- set_coverage(begin = first(date[days]), 
+               end = last(date[days]),
+               geographicDescription = "Niwot Ridge, CO, USA ",
+               west = -105.5464, east = -105.5464, 
+               north = 40.0329, south = 40.0329)
+
+dataset = eml$dataset(
+               title = "A simple carbon cycle forecast",
+               creator = me,
+               contact = list(references="https://orcid.org/0000-0002-2324-2518"),
+               pubDate = start_date,
+               intellectualRights = "",
+               abstract =  "An illustration of how we might use a particle filter to constrain a simple carbon forecast",
+               dataTable = dataTable,
+               coverage = coverage
+               )
+
+## EFI specific forecast metadata
+additionalMetadata <- eml$additionalMetadata(
+  metadata = list(
+    forecast = list(
+## Basic elements
+      timestep = paste(timestep,"seconds"), 
+      forecast_horizon = paste(days,"days"),
+      start_time = start_date,
+      iteration_id = Sys.time(),
+      project_id = "Flux Course 2022",
+      metadata_standard_version = "0.4",
+      model_description = list(
+        model_id = "SSEM",
+        name = "Super Simple Ecosystem Model",
+        type = "process-based",
+        repository = "https://github.com/ecoforecast/EFActivites"
+      ),
+## MODEL STRUCTURE & UNCERTAINTY CLASSES
+      initial_conditions = list(
+        # Possible values: absent, present, data_driven, propagates, assimilates
+        status = "assimilates",
+        # Number of parameters / dimensionality
+        complexity = 3 
+      ),
+      drivers = list(
+        status = "data_driven",
+        complexity = 2
+      ),
+      parameters = list(
+        status = "assimilates",
+        complexity = 9   
+      ),
+      random_effects = list(
+        status = "absent"
+      ),
+      process_error = list(
+        status = "assimilates",
+        propagation = list(
+          type = "ensemble", # ensemble vs analytic
+          size = ne         # required if ensemble
+        ),
+        complexity = 3,   
+        covariance = FALSE
+      ),
+      obs_error = list(
+        status = "data_driven",
+        complexity = 1,   
+        covariance = FALSE
+      )
+    ) # forecast
+  ) # metadata
+) # eml$additionalMetadata
+
+my_eml <- eml$eml(dataset = dataset,
+           additionalMetadata = additionalMetadata,
+           packageId = Sys.time() , 
+           system = "datetime"  ## system used to generate packageId
+           )
+
+## check that the EML is also a valid EFI forecast
+#EFIstandards::forecast_validator(my_eml)
+meta_file = file.path(outdir,paste0("terrestrial_30min_",start_date,"_SSEM.xml"))
+write_eml(my_eml, meta_file)
+```
+
+
+
+# Submission
+
+example of how you would submit the forecast to the EFI NEON challenge (by default, doesn't actually run)
+```
+Sys.setenv("AWS_DEFAULT_REGION" = "data",
+           "AWS_S3_ENDPOINT" = "ecoforecast.org")
+
+aws.s3::put_object(object = fx_file, bucket = "submissions")
+aws.s3::put_object(object = meta_file, bucket = "submissions")
+```
+
+# Next steps
+
+* Run the forecast into the future using forecast meteorology (EFI provides NOAA GEFS 35 day, 31 ensemble)
+```{r}
+Sys.unsetenv("AWS_DEFAULT_REGION")
+Sys.unsetenv("AWS_S3_ENDPOINT")
+Sys.setenv(AWS_EC2_METADATA_DISABLED="TRUE")
+s3 <- arrow::s3_bucket("drivers/noaa/neon/gefs", 
+                       endpoint_override =  "js2.jetstream-cloud.org:8001",
+                       anonymous=TRUE)
+df <- arrow::open_dataset(s3)
+dc <- df %>% 
+  filter(site_id == "NIWO",start_time >= as.Date("2022-07-01"), variable %in% c("TMP","DSWRF")) %>%
+  collect()
+met <- dc %>% filter(start_time == as.Date("2022-07-01 00:00:00")) %>% pivot_wider(names_from = ensemble,values_from = predicted)
+PAR = met %>% filter(variable == "DSWRF") 
+inputs <- list(
+  date = PAR$time,
+  temp = temp = met %>% filter(variable == "TMP") %>% head(-1) %>% select(-(1:9)) %>% t(), ## air temperature (Celsius)
+  PAR  = as.matrix(t(PAR[,-(1:9)])) / 0.486 ## gap filled PAR, conversion From Campbell and Norman p151
+)
+```
+Note that met variables are now matrices of ensemble members that need to be sampled over!
+
+* Automate to run every day!
+See https://github.com/eco4cast/neon4cast-example for example. To do so you'd want to save the calibration we've done here and set up an R script that just runs the Forecast Analysis cycle for a specific start date.
+
+* Additional data constraints (e.g. MODIS LAI)
+* Additional sites
+* Longer calibration (do parameters vary by season? by year?)
+
