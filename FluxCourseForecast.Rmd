@@ -132,8 +132,11 @@ for(i in 1:3){
 
 # Drivers
 ```{r}
-## data downloaded from FLUXNET2015 "fullset" product
-flux <- read_csv(file.path(indir,"AMF_US-NR1_FLUXNET_FULLSET_1998-2016_3-5","AMF_US-NR1_FLUXNET_FULLSET_HH_1998-2016_3-5.csv"))
+## data downloaded from FLUXNET2015 "fullset" product, subset to 2015 for this analysis
+# flux <- read_csv("AMF_US-NR1_FLUXNET_FULLSET_HH_1998-2016_3-5.csv")
+# flux <- flux %>% filter(date > as.Date("2015-01-01"))
+# write_csv(x=flux,file= "data/US-NR1_Flux2015.csv")
+flux <- read_csv("data/US-NR1_Flux2015.csv")
 date = strptime(flux$TIMESTAMP_START,format="%Y%m%d%H%M")
 
 inputs <- data.frame(
