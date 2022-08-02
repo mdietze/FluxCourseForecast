@@ -28,9 +28,6 @@ horiz_calib = 1  #day   forecast horizon during calibration
 horiz       = 35 #days, forecast horizon during forecast
 
 outdir = "./" ## output directory for saving files
-
-indir = "~/Google Drive/Teaching/FluxCourseForecast2022/" ## input directory for reading training data
-## this folder is available at https://bit.ly/3POkhq9
 ```
 
 # Why Forecast
@@ -107,8 +104,10 @@ There are a few assumptions in developing the initial conditions
 ### These specific data points were extracted from the US-NR1 Ameriflux BADM files
 ### https://ameriflux.lbl.gov/sites/siteinfo/US-NR1
 ### METADATA: https://ameriflux.lbl.gov/data/badm/badm-standards/ 
+### data is also available at https://bit.ly/3POkhq9
 #library(readxl)
-#badm = readxl::read_xlsx(file.path(indir,"AMF_AA-Flx_FLUXNET-BIF_CCBY4_20220606.xlsx")) %>% filter(SITE_ID == "US-NR1")
+#badm = readxl::read_xlsx(file.path("AMF_AA-Flx_FLUXNET-BIF_CCBY4_20220606.xlsx")) %>% filter(SITE_ID == "US-NR1")
+#write_csv(x=badm,file="data/US-NR1_BADM.csv")
 #Bwood = badm %>% filter(VARIABLE == "AG_BIOMASS_TREE") %>% select(DATAVALUE) %>% type_convert() ## unsuccessful crack at automating extraction
 Bwood = 14500 * 1e-6 * 10000 ## convert g/m2 -> Mg/ha
 Bleaf = 2950 * 0.01  ## generates a LAI that is too high ***
