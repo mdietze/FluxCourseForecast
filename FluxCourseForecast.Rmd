@@ -10,11 +10,10 @@ library(compiler)
 library(tidyverse)
 library(mvtnorm)
 library(EML)
-#remotes::install_github("ecoforecast/ecoforecastR")
-library(ecoforecastR)
 #remotes::install_github("eco4cast/EFIstandards")
 #library(EFIstandards)
 source("R/functions.R")
+source("R/utils.R")
 
 ## configuration
 
