@@ -3,7 +3,6 @@ library(compiler)
 library(tidyverse)
 library(mvtnorm)
 library(EML)
-library(ecoforecastR)
 source("R/functions.R")
 ne = 500 ## production run should be 200 - 5000, depending on what your computer can handle
 
@@ -18,8 +17,8 @@ horiz       = 35 #days, forecast horizon during forecast
 
 ## Get latest increment of data (flux & met)
 target <- arrow::s3_bucket("targets/terrestrial_30min", endpoint_override="data.ecoforecast.org") %>% 
-  filter(site_id == "NIWO",time >= as.Date(today)-jumpBack) %>%
-  collect()
+  dplyr::filter(site_id == "NIWO",time >= as.Date(today)-jumpBack) %>%
+  dplyr::collect()
 
 ## build dat for Analysis  ******
 #nep = -flux$NEE_VUT_REF[today]

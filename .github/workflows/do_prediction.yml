@@ -1,0 +1,22 @@
+on:
+  workflow_dispatch:
+#  schedule:
+#  - cron: "0 20 * * *"
+#  push:
+
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: eco4cast/rocker-neon4cast
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: install R packages
+        run: R -e 'source("install.R")' 
+# Point to the right path, run the right Rscript command
+      - name: Run automatic prediction file
+        run: Rscript forecast_model.R
