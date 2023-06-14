@@ -1,6 +1,6 @@
 ---
 title: "Carbon Forecast"
-author: "Flux Course 2022"
+author: "Flux Course 2023"
 output: html_document
 ---
 
@@ -300,6 +300,8 @@ dat = data.frame(nep = nep,
 ## run PF
 Analysis[[1]] = ParticleFilter(output.ensemble,params,dat,wt = rep(1,ne))
 
+# Save the Analysis
+saveRDS(Analysis[[1]],file=file.path("analysis",paste0(start_date,".RDS")))
 ```
 
 If you liked the Particle Filter, you may also like...
@@ -346,12 +348,16 @@ for(t in 1:ndays){
   # Today's analysis
   Analysis[[t+1]] = ParticleFilter(out,Analysis[[t]]$params, dat,wt = Analysis[[t]]$wt)
   
+  # Save the Analysis
+  saveRDS(Analysis[[t+1]],file=file.path("analysis",paste0(start_date+t+1,".RDS")))
+
+  
   # counter to help us know things are still running
   print(t)
 }
 
-## Save the Analysis
-saveRDS(Analysis,file="Analysis.RDS")
+# Save the Analysis List
+saveRDS(Analysis,file="AnalysisList.RDS")
 
 ## effective sample size over time
 weights = sapply(Analysis,function(x){x$wt})
@@ -549,14 +555,27 @@ aws.s3::put_object(object = fx_file, bucket = "submissions")
 aws.s3::put_object(object = meta_file, bucket = "submissions")
 ```
 
-# Next steps
+# Run an actual forecast!
 
 * Run the forecast into the future using forecast meteorology (EFI provides NOAA GEFS 35 day, 31 ensemble)
 
 Note that met variables are now matrices of ensemble members that need to be sampled over!
 
+
+# Workflow automation
+
+The first part of this file (on: workflow dispatch) used cron to schedule the workflow. The forecast in this repository is designed to run daily at 20:00 UTC.  The execution of the forecast occurs on GitHub's servers, so your local computer does not need to be turned on.  In ".github/workflow/do_prediction.yml", the lines `-cron: "* 20 * *"` define the time that the forecast is run.  In this case it is run each day at 20:00:00 UTC (note all GitHub timings are on UTC).  You can update this to run on a different schedule based on timing codes found in https://crontab.guru
+
+The second part of this file (jobs) is used to grab a copy of a Docker container image, eco4cast/rocker-neon4cast, that has R and a large number of R packages pre-installed, including the NEON forecast challenge packages.
+
+The final part of this file (run) tells Github Actions what Rscript it should run
+
 * Automate to run every day!
 See https://github.com/eco4cast/neon4cast-example for example. To do so you'd want to save the calibration we've done here and set up an R script that just runs the Forecast Analysis cycle for a specific start date.
+
+A video providing more information about how to use GitHub actions for automated forecast generation can be found here: https://youtu.be/dMrUlXi4_Bo
+
+# Next steps
 
 * Additional data constraints (e.g. MODIS LAI)
 * Additional sites
