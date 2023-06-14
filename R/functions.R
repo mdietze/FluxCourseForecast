@@ -41,7 +41,7 @@ SSEM.orig <- function(X, params, inputs, timestep = 1800){
                Rh = Rh, litterfall = litterfall, mortality = mortality))
   
 }
-SSEM <- cmpfun(SSEM.orig)  ## byte compile the function to make it faster
+SSEM <- compiler::cmpfun(SSEM.orig)  ## byte compile the function to make it faster
 
 
 ##` @param X       Initial Conditions [leaf carbon, wood carbon, soil organic carbon] (units=Mg/ha)
@@ -205,3 +205,150 @@ beta.match <- function(mu, var){   ## Beta distribution moment matching
   b = a * (1 - mu) / mu
   return(data.frame(a = a, b = b))
 }
+
+## Flux uncertainty functions
+## Borrowed from https://github.com/PecanProject/pecan/tree/develop/modules/uncertainty/R/flux_uncertainty.R
+#--------------------------------------------------------------------------------------------------#
+
+##' Get delta between sequential flux datapoints
+##' 
+##' @name get.change
+##' @title Get delta between sequential flux datapoints
+##' @return Difference between consecutive measurements
+##' @export
+##' @author Mike Dietze, Carl Davidson
+get.change <- function(measurement) {
+  gaps <- measurement %in% c(-6999, -9999)
+  # | quality > 0
+  measurement[gaps] <- NA
+  even <- seq(measurement)%%2 == 0
+  odd <- seq(measurement)%%2 == 1
+  return(measurement[even] - measurement[odd])
+} # get.change
+
+##' Calculate parameters for heteroskedastic flux uncertainty
+##' 
+##' @name flux.uncertainty
+##' @title Calculate parameters for heteroskedastic flux uncertainty
+##' @param measurement = flux time-series
+##' @param QC = quality control flag time series (0 = best)
+##' @param flags = additional flags on flux filtering of PAIRS (length = 1/2 that of the 
+##'                time series, TRUE = use).
+##' @param bin.num = number of bins (default = 10)
+##' @param transform = transformation of magnitude (default = identity)
+##' @param minBin = minimum number of points allowed in a bin
+##' @return return.list List of parameters from the fitted uncertainty model
+##' @export
+##' @author Mike Dietze, Carl Davidson
+flux.uncertainty <- function(measurement, QC = 0, flags = TRUE, bin.num = 10, 
+                             transform = identity, minBin = 5, ...) {
+  if(length(QC)==1) QC = rep(QC,length=length(measurement))
+  
+  ## calcuate paired differences between points
+  change <- get.change(measurement)
+  
+  ## convert gaps to NA
+  gaps <- measurement %in% c(-6999, -9999)
+  # | quality > 0
+  measurement[gaps] <- NA
+  
+  ## combine all indicators
+  even <- seq(measurement) %% 2 == 0
+  odd <- seq(measurement) %% 2 == 1
+  Q2 <- QC[even] == 0 & QC[odd] == 0 & flags & !is.na(measurement[even]) & !is.na(measurement[odd])
+  
+  ## calulate error and flux magnitude for each pair of points
+  indErr <- abs(change[Q2]) / sqrt(2)
+  magnitude <- measurement[even][Q2]
+  
+  ## calculate bins
+  bins <- seq(from = min(magnitude, na.rm = TRUE),
+              to = max(magnitude, na.rm = TRUE), 
+              length.out = bin.num)
+  
+  ## calculate binned mean, error, bias, and sample size
+  magBin <- c()
+  errBin <- c()
+  biasBin <- c()
+  nBin <- c()
+  for (k in 1:(length(bins) - 1)) {
+    use <- magnitude >= bins[k] & magnitude < bins[k + 1]
+    nBin[k] <- sum(use, na.rm = TRUE)
+    magBin[k] <- mean(transform(magnitude[use]), na.rm = TRUE)
+    
+    if (nBin[k] > minBin) {
+      ## && sum(!is.na(change[use])) > 50) {
+      errBin[k] <- stats::sd(indErr[use], na.rm = TRUE)
+      biasBin[k] <- mean(indErr[use], na.rm = TRUE)
+      print(paste(length(magnitude[use]), sum(!is.na(change[use])), 
+                  magBin[k], errBin[k]))
+    } else {
+      if (nBin[k] == 0) {
+        magBin[k] <- NA
+      }
+      errBin[k] <- NA
+      biasBin[k] <- NA
+      print(paste(length(magnitude[use]), sum(!is.na(change[use]))))
+    }
+  }
+  
+  ## separate fluxes into positive, negative, and zero bins
+  zero <- diff(sign(bins)) > 0
+  pos <- magBin > 0 & !zero
+  neg <- magBin < 0 & !zero
+  
+  ## subtract off zero bin, fit regression to positive and negative components
+  ## would be better to fit a two line model with a common intercept, but this
+  ## is quicker to implement for the time being
+  E2 <- errBin - errBin[zero]
+  E2 <- errBin - errBin[zero]
+  intercept <- errBin[zero]
+  
+  return.list <- list(mag = magBin, 
+                      err = errBin, 
+                      bias = biasBin, 
+                      n = nBin,
+                      intercept = intercept)
+  
+  if(!all(is.na(E2[pos]))){
+    mp <- stats::lm(E2[pos] ~ magBin[pos] - 1)
+    return.list$slopeP <- mp$coefficients[1]
+  } 
+  if(!all(is.na(E2[neg]))){
+    mn <- stats::lm(E2[neg] ~ magBin[neg] - 1)
+    return.list$slopeN <- mn$coefficients[1]
+  }else{
+    return.list$slopeN <- mp$coefficients[1]
+  }
+  
+  return(return.list)
+} # flux.uncertainty
+
+predict.flux.uncertainty <- function(magnitude,return.list){
+  fu = rep(return.list$intercept,length=length(magnitude))
+  pos = which(magnitude > 0)
+  neg = which(magnitude < 0)
+  fu[pos] = fu[pos] + return.list$slopeP*magnitude[pos]
+  fu[neg] = fu[neg] + return.list$slopeN*magnitude[neg]
+  return(fu)
+}
+
+#--------------------------------------------------------------------------------------------------#
+##' Plot fit for heteroskedastic flux uncertainty
+##' 
+##' @name plot_flux_uncertainty
+##' @title Plot fit for heteroskedastic flux uncertainty
+##' @param f  output of flux.uncertainty functions
+##' @param ...  optional graphical paramters
+##' @export
+##' @author Mike Dietze, Carl Davidson
+plot_flux_uncertainty <- function(f, ...) {
+  graphics::plot(f$mag, f$err, ...)
+  big <- 10000
+  graphics::lines(c(0, big), c(f$intercept, f$slopeP * big))
+  graphics::lines(c(0, -big), c(f$intercept, -f$slopeN * big))
+  graphics::legend("bottomleft", legend = c("intercept", f$intercept,
+                                            "slopeP", f$slopeP, 
+                                            "slopeN", f$slopeN))
+} # plot_flux_uncertainty
+
