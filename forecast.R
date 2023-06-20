@@ -19,6 +19,7 @@ ne = nrow(Analysis$X)      ## keep existing ensemble size
 if(is.null(Analysis$met)){ ## met ensemble not resampled
   Analysis$met = sample(1:30,ne,replace=TRUE)
 }
+print(paste("last.date",last.date))
 
 ######### SET UP DATES ##########
 today = Sys.time()
@@ -82,10 +83,16 @@ dr = neon4cast::noaa_stage3() |>
   dplyr::filter(site_id == SITE_ID,
                   variable %in% c("air_temperature","surface_downwelling_shortwave_flux_in_air")) |>
   dplyr::collect()
+print(paste("dr1",dim(dr)))
 dr = dr |> 
-  dplyr::filter(between(datetime,as.Date(lubridate::as_datetime(as.Date(today)-jumpBack)),lubridate::as_datetime(today))) |> ## couldn't get between to work in initial query
+  dplyr::filter(between(datetime,
+                        lubridate::as_datetime(as.Date(today)-jumpBack),
+                        lubridate::as_datetime(today))) |> ## couldn't get between to work in initial query
   na.omit() |>
   pivot_wider(names_from = parameter,values_from = prediction)
+print(paste("dr2",dim(dr)))
+table(dr$site_id)
+table(dr$datetime)
 PAR = dr |> 
   filter(variable == "surface_downwelling_shortwave_flux_in_air") |> 
   select(-(1:7)) |> as.matrix()
@@ -168,6 +175,7 @@ fx3 = fx2 |> filter(parameter %in% param)
 setwd(outdir)
 fx_file = paste0("terrestrial_30min-",today_ch,"-SSEM.csv") ## output filename
 write_csv(fx2,fx_file)
+setwd("..")
 
 ######## Submit ########
 neon4cast::submit(forecast_file = fx_file, metadata = NULL, ask = FALSE)
