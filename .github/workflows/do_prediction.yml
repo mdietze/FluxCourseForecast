@@ -10,7 +10,7 @@ jobs:
     if: github.repository == 'mdietze/FluxCourseForecast'  ## update to your username
     runs-on: ubuntu-latest
     container:
-      image: eco4cast/rocker-neon4cast
+      image: rocker/geospatial
     steps:
       - name: Checkout repo
         uses: actions/checkout@v3
