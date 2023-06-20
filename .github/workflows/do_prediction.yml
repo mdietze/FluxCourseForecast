@@ -9,6 +9,8 @@ jobs:
   build:
 #    if: github.repository == 'mdietze/FluxCourseForecast'  ## update to your username
     runs-on: ubuntu-latest
+    env:
+      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
     container:
       image: rocker/geospatial
     steps:
