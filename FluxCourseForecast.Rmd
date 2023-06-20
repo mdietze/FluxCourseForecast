@@ -301,7 +301,8 @@ dat = data.frame(nep = nep,
 Analysis[[1]] = ParticleFilter(output.ensemble,params,dat,wt = rep(1,ne))
 
 # Save the Analysis
-saveRDS(Analysis[[1]],file=file.path("analysis",paste0(start_date,".RDS")))
+dir.create("demo_analysis",showWarnings = FALSE)
+saveRDS(Analysis[[1]],file=file.path("demo_analysis",paste0(start_date,".RDS")))
 ```
 
 If you liked the Particle Filter, you may also like...
@@ -349,7 +350,7 @@ for(t in 1:ndays){
   Analysis[[t+1]] = ParticleFilter(out,Analysis[[t]]$params, dat,wt = Analysis[[t]]$wt)
   
   # Save the Analysis
-  saveRDS(Analysis[[t+1]],file=file.path("analysis",paste0(start_date+t+1,".RDS")))
+  saveRDS(Analysis[[t+1]],file=file.path("demo_analysis",paste0(start_date+t+1,".RDS")))
 
   
   # counter to help us know things are still running
