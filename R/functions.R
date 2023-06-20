@@ -14,11 +14,13 @@ SSEM.orig <- function(X, params, inputs, timestep = 1800){
   
   ## photosynthesis
   LAI = X[, 1] * params$SLA * 0.1  #0.1 is conversion from Mg/ha to kg/m2
-  if(inputs$PAR > 1e-20){
-    GPP = pmax(0, params$alpha * (1 - exp(-0.5 * LAI)) * inputs$PAR)
-  } else {
-    GPP = rep(0, ne)
-  }
+  GPP = pmax(0, params$alpha * (1 - exp(-0.5 * LAI)) * inputs$PAR)
+  GPP[inputs$PAR < 1e-20] = 0 ## night
+  # if(inputs$PAR > 1e-20){
+  #   GPP = pmax(0, params$alpha * (1 - exp(-0.5 * LAI)) * inputs$PAR)
+  # } else {
+  #   GPP = rep(0, ne)
+  # }
   
   ## respiration & allocation
   alloc = GPP *   params[,c("falloc.1","falloc.2","falloc.3")] ## Ra, NPPwood, NPPleaf
@@ -50,12 +52,17 @@ SSEM <- compiler::cmpfun(SSEM.orig)  ## byte compile the function to make it fas
 ensemble_forecast <- function(X,params,inputs){
   nt = nrow(inputs)
   output = array(0.0, c(nt, ne, 12))     ## output storage [time step,ensembles,variables]
+  if(length(dim(inputs)) < 3){ ## add ens dim to non-ensemble met
+    i2 = array(inputs,dim=c(nrow(inputs),1,2)) ## [time,ensemble,variable]
+    dimnames(i2)[[3]] = colnames(inputs)
+    inputs = i2
+  }
   
   ## forward ensemble simulation
   for(t in 1:nt){
-    output[t, , ] <- SSEM(X, params, inputs[t, ])  ## run model, save output
+    output[t, , ] <- SSEM(X, params, as.data.frame(inputs[t, , ]))  ## run model, save output
     X <- output[t, , 1:3]                          ## set most recent prediction to be the next IC
-    if((t %% 336) == 0) print(t / 336)             ## counter: weeks elapsed (7*48 = 1 week)
+    if((t %% 336) == 0) print(t)             ## counter: weeks elapsed (7*48 = 1 week)
   }
   output[is.nan(output)] = 0
   output[is.infinite(output)] = 0
@@ -71,7 +78,7 @@ smooth.params <- function(params,h=1){
   params.star = params
   thetaBar = colMeans(params)
   SIGMA = cov(params)
-  epsilon = rmvnorm(ne,rep(0,ncol(params)),SIGMA) ## propose deviations
+  epsilon = mvtnorm::rmvnorm(ne,rep(0,ncol(params)),SIGMA) ## propose deviations
   ## Kernel Smooth each row
   for(i in 1:nrow(params.star)){
     params.star[i,] = thetaBar + h*(params[i,] - thetaBar) + epsilon[i,]*sqrt(1-h^2)
@@ -102,9 +109,13 @@ ParticleFilter <- function(out,params,dat,wt=1){
   }
   
   ## calculate the cumulative likelihoods to be used as PF weights
-  like = rep(NA,ne)
-  for(i in 1:ne){
-    like[i] = exp(sum(dnorm(dat$nep, out[,i,6], dat$sigma.nep, log = TRUE),na.rm = TRUE))  ## calculate log likelihoods
+  like = rep(0,ne)
+  mult = 1 ## uncertainty multiplier
+  while(all(like <= 0)){ ## HACK in case obs errors are too small to calculate any likelihood at all
+    for(i in 1:ne){
+      like[i] = exp(sum(dnorm(dat$nep, out[,i,6], dat$sigma.nep*mult, log = TRUE),na.rm = TRUE))  ## calculate log likelihoods
+    }
+    mult = mult*2 
   }
   wt = like * wt ## update weights
   
@@ -205,6 +216,8 @@ beta.match <- function(mu, var){   ## Beta distribution moment matching
   b = a * (1 - mu) / mu
   return(data.frame(a = a, b = b))
 }
+
+K2C = function(x){x-273.15} ## Kelvin to Celsius
 
 ## Flux uncertainty functions
 ## Borrowed from https://github.com/PecanProject/pecan/tree/develop/modules/uncertainty/R/flux_uncertainty.R
