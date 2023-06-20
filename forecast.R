@@ -21,8 +21,7 @@ if(is.null(Analysis$met)){ ## met ensemble not resampled
 }
 
 ######### SET UP DATES ##########
-#today = Sys.time()
-today = "2022-07-01 00:00:00"
+today = Sys.time()
 today_timestamp = strptime(today, "%Y-%m-%d %H:%M:%S",tz="UTC")
 today_ch        = as.character(as.Date(today))
 jumpBack = min(100,max(10,as.Date(today) - as.Date(last.date)-1))  ## how many days do we want go back to account for data latency?
