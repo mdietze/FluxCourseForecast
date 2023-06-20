@@ -30,6 +30,7 @@ jumpBack = min(100,max(10,as.Date(today) - as.Date(last.date)-1))  ## how many d
 ## TODO: improve min jumpBack (currently 10 days) by explicitly keeping track of last data assimilated
 start_date = lubridate::as_date(today)-lubridate::days(jumpBack)
 horiz       = 35 #days, forecast horizon during forecast
+print(paste("Run settings [today,yesterday,jumpBack,start_date]:",today,yesterday,jumpBack,start_date))
 
 ######## Get latest increment of data (flux) ########
 target <- readr::read_csv("https://data.ecoforecast.org/neon4cast-targets/terrestrial_30min/terrestrial_30min-targets.csv.gz", guess_max = 1e6) |>
@@ -50,6 +51,7 @@ unc = predict.flux.uncertainty(nee.reforecast$obs,fu.params)
 dat = data.frame(nep = -nee.reforecast$obs,
                  sigma.nep = unc
 )
+print(paste("Available data constraints",dim(dat)))
 
 ########  Get weather forecast ######
 dc = neon4cast::noaa_stage2() |>
@@ -73,6 +75,7 @@ for(t in 1:nrow(inputs)){
   inputs[t,is.na(inputs[t, ,"temp"]),"temp"] = mean(inputs[t, ,"temp"],na.rm = TRUE)
   inputs[t,is.na(inputs[t, ,"PAR" ]),"PAR"]  = mean(inputs[t, ,"PAR"],na.rm = TRUE)
 }
+print(paste("Available forecast meteorology:",dim(inputs)))
 
 ######## reforecast met: stitch together first day of each weather forecast ######
 dr = neon4cast::noaa_stage3() |>
@@ -94,6 +97,8 @@ inputs.reforecast = array(dim=c(nrow(PAR),ne,2))
 dimnames(inputs.reforecast)[[3]] = c("temp","PAR")
 inputs.reforecast[,,"temp"] = temp[, Analysis$met] - 273.15  ## air temperature (Celsius)
 inputs.reforecast[,,"PAR"]  = PAR[, Analysis$met] / 0.486 ## gap filled PAR, conversion From Campbell and Norman p151
+print(paste("available reforecast inputs",dim(inputs.reforecast)))
+
 
 #########  REFORECAST  ############
 date = nee.reforecast$hour    ## used as time in reforecast
@@ -105,6 +110,8 @@ for(t in 1:(jumpBack-1)){
   
   # select input rows based on date
   now = which(date >= (start_date + lubridate::days(t-1)) & date < (start_date + lubridate::days(t)))
+  print(paste("selected rows:",range(now)))
+        
   
   # forecast
   out = ensemble_forecast(X = Analysis$X,           ## initial conditions = yesterday's Analysis
@@ -122,6 +129,7 @@ for(t in 1:(jumpBack-1)){
     # Save the Analysis
     saveRDS(newAnalysis,file=file.path("analysis",paste0(start_date+lubridate::days(t),".RDS")))
   } else {
+    print("skipping ParticleFilter")
     newAnalysis = Analysis
     newAnalysis$X  = out[nrow(out),,1:3] ## update state, parameters and weights stay the same
     ## don't save no-data steps so can properly detect next last.date
@@ -135,6 +143,7 @@ for(t in 1:(jumpBack-1)){
 out.f = ensemble_forecast(X = Analysis$X,           ## initial conditions = yesterday's Analysis
                         params = Analysis$params,   ## today's parameters = yesterday's Analysis
                         inputs = inputs)            ## today's subset of meteorology 
+print(paste("Ensemble Forecast:",dim(out.f)))
 
 
 ######## Convert Forecast to standard & save ########
