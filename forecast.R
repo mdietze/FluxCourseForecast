@@ -3,7 +3,7 @@ library(tidyverse)
 source("R/functions.R")
 n_submit = 50         ## sample size of ensemble members submitted to EFI
 timestep = 3600       ## seconds, driven by timestep of met data
-site_id  = "NIWO"     ## NEON site code
+SITE_ID  = "NIWO"     ## NEON site code
 outdir   = "forecast" ## where should forecasts be saved locally before submitting
 dir.create(outdir,showWarnings = FALSE)
 dir.create("analysis",showWarnings = FALSE) ## should already exist
@@ -24,21 +24,24 @@ if(is.null(Analysis$met)){ ## met ensemble not resampled
 today = Sys.time()
 today_timestamp = strptime(today, "%Y-%m-%d %H:%M:%S",tz="UTC")
 today_ch        = as.character(as.Date(today))
+yesterday       = as.Date(today_timestamp - lubridate::days(1))
 jumpBack = min(100,max(10,as.Date(today) - as.Date(last.date)-1))  ## how many days do we want go back to account for data latency?
 ## NOTE: max of 100 is arbitrary, system should happily jumpBack any amount of time
 ## TODO: improve min jumpBack (currently 10 days) by explicitly keeping track of last data assimilated
-start_date = lubridate::as_datetime(today)-lubridate::days(jumpBack)
+start_date = lubridate::as_date(today)-lubridate::days(jumpBack)
 horiz       = 35 #days, forecast horizon during forecast
 
 ######## Get latest increment of data (flux) ########
 target <- readr::read_csv("https://data.ecoforecast.org/neon4cast-targets/terrestrial_30min/terrestrial_30min-targets.csv.gz", guess_max = 1e6) |>
-  dplyr::filter(site_id == site_id)
+  dplyr::filter(site_id == SITE_ID)
 
 ## build dat for Analysis
 nee = target |> filter(variable == "nee")
 fu.params = flux.uncertainty(nee$observation) ## use full dataset to calibrate uncertainty rel'n
 nee.reforecast = nee |> 
-  dplyr::filter(between(datetime,lubridate::as_datetime(as.Date(today)-jumpBack),lubridate::as_datetime(today))) |>
+  dplyr::filter(between(datetime,
+                        as.Date(lubridate::as_datetime(as.Date(today)-jumpBack)),
+                        lubridate::as_datetime(today))) |>
   dplyr::mutate(hour = lubridate::floor_date(datetime,"hour")) |>  ## aggregate fluxes to hourly
   dplyr::group_by(hour) |>
   dplyr::summarise(obs = mean(observation,na.rm = TRUE))
@@ -50,9 +53,9 @@ dat = data.frame(nep = -nee.reforecast$obs,
 
 ########  Get weather forecast ######
 dc = neon4cast::noaa_stage2() |>
-  dplyr::filter(site_id == site_id,
+  dplyr::filter(site_id == SITE_ID,
                 variable %in% c("air_temperature","surface_downwelling_shortwave_flux_in_air"),
-                start_date == today_ch) |>
+                start_date == as.character(yesterday)) |>   ## assuming that today's forecast hasn't posted yet
   dplyr::collect()
 met <- dc  |> pivot_wider(names_from = parameter,values_from = prediction)
 PAR = met |> 
@@ -73,11 +76,11 @@ for(t in 1:nrow(inputs)){
 
 ######## reforecast met: stitch together first day of each weather forecast ######
 dr = neon4cast::noaa_stage3() |>
-  dplyr::filter(site_id == site_id,
+  dplyr::filter(site_id == SITE_ID,
                   variable %in% c("air_temperature","surface_downwelling_shortwave_flux_in_air")) |>
   dplyr::collect()
 dr = dr |> 
-  dplyr::filter(between(datetime,lubridate::as_datetime(as.Date(today)-jumpBack),lubridate::as_datetime(today))) |> ## couldn't get between to work in initial query
+  dplyr::filter(between(datetime,as.Date(lubridate::as_datetime(as.Date(today)-jumpBack)),lubridate::as_datetime(today))) |> ## couldn't get between to work in initial query
   na.omit() |>
   pivot_wider(names_from = parameter,values_from = prediction)
 PAR = dr |> 
@@ -93,9 +96,10 @@ inputs.reforecast[,,"temp"] = temp[, Analysis$met] - 273.15  ## air temperature 
 inputs.reforecast[,,"PAR"]  = PAR[, Analysis$met] / 0.486 ## gap filled PAR, conversion From Campbell and Norman p151
 
 #########  REFORECAST  ############
-date = nee.reforecast$hour
-forecast <- array(NA,c(86400/timestep*(jumpBack),ne,12)) ## output storage [time, ensemble, state]
-for(t in 1:jumpBack){
+date = nee.reforecast$hour    ## used as time in reforecast
+date = seq(nee.reforecast$hour[1],today_timestamp,by=lubridate::seconds(timestep))
+forecast <- array(NA,c(86400/timestep*jumpBack,ne,12)) ## output storage [time, ensemble, state]
+for(t in 1:(jumpBack-1)){
   # counter to help us know things are still running
   print(start_date + lubridate::days(t-1))
   
@@ -109,14 +113,20 @@ for(t in 1:jumpBack){
   forecast[now,,] = out                           ## store today's forecast in overall array
   
   # Today's analysis
-  newAnalysis = ParticleFilter(out,
-                               params=Analysis$params, 
-                               dat = dat[now,],
-                               wt = Analysis$wt)
-  newAnalysis$met = Analysis$met
+  if(any(!is.na(dat[now,]))){
+    newAnalysis = ParticleFilter(out,
+                                 params=Analysis$params, 
+                                 dat = dat[now,],
+                                 wt = Analysis$wt)
+    newAnalysis$met = Analysis$met
+    # Save the Analysis
+    saveRDS(newAnalysis,file=file.path("analysis",paste0(start_date+lubridate::days(t),".RDS")))
+  } else {
+    newAnalysis = Analysis
+    newAnalysis$X  = out[nrow(out),,1:3] ## update state, parameters and weights stay the same
+    ## don't save no-data steps so can properly detect next last.date
+  }
   
-  # Save the Analysis
-  saveRDS(newAnalysis,file=file.path("analysis",paste0(start_date+lubridate::days(t),".RDS")))
   Analysis = newAnalysis
   
 }
@@ -136,7 +146,7 @@ fx2 = fx |>
   dplyr::mutate(dplyr::across(variable, ~ str_replace_all(.x,'NEP', 'nee'))) |> ## rename NEP -> NEE
   dplyr::mutate(prediction = -prediction) |>                                    ## change sign on NEE 
   dplyr::mutate(reference_datetime = today_timestamp) |> relocate(reference_datetime) |> ## add reference_datetime
-  dplyr::mutate(site_id = site_id) |> relocate(site_id,.after=datetime) |>               ## add site_id
+  dplyr::mutate(site_id = SITE_ID) |> relocate(site_id,.after=datetime) |>               ## add site_id
   dplyr::mutate(family = "ensemble") |> relocate(family,.before=parameter) |>            ## add family
   dplyr::mutate(datetime = lubridate::as_datetime(as.character(datetime))) |>            ## make sure datetime is formatted correctly
   dplyr::mutate(parameter = as.numeric(parameter))                                       ## make sure parameter is formatted correctly
