@@ -110,6 +110,7 @@ print(paste("available reforecast inputs",dim(inputs.reforecast)))
 #########  REFORECAST  ############
 date = nee.reforecast$hour    ## used as time in reforecast
 date = seq(nee.reforecast$hour[1],today_timestamp,by=lubridate::seconds(timestep))
+print(paste("date",length(date),paste(range(date),collapse=",")))
 forecast <- array(NA,c(86400/timestep*jumpBack,ne,12)) ## output storage [time, ensemble, state]
 for(t in 1:(jumpBack-1)){
   # counter to help us know things are still running
@@ -117,7 +118,7 @@ for(t in 1:(jumpBack-1)){
   
   # select input rows based on date
   now = which(date >= (start_date + lubridate::days(t-1)) & date < (start_date + lubridate::days(t)))
-  print(paste("selected rows:",range(now)))
+  print(paste("'now' selected rows:",length(now),paste(range(now),collapse=","),collapse = " "))
         
   
   # forecast
