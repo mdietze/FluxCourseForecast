@@ -1,8 +1,10 @@
 ## Configuration
 library(tidyverse)
 source("R/functions.R")
-timestep = 3600 #seconds, driven by timestep of met data
-outdir   = "forecast"
+n_submit = 50         ## sample size of ensemble members submitted to EFI
+timestep = 3600       ## seconds, driven by timestep of met data
+site_id  = "NIWO"     ## NEON site code
+outdir   = "forecast" ## where should forecasts be saved locally before submitting
 dir.create(outdir,showWarnings = FALSE)
 ## ONE TIME: to initiate workflow, copy calibration analysis to day before start date
 ## e.g. cp analysis/2015-07-01.RDS analysis/2022-07-01.RDS
@@ -30,7 +32,7 @@ horiz       = 35 #days, forecast horizon during forecast
 
 ######## Get latest increment of data (flux) ########
 target <- readr::read_csv("https://data.ecoforecast.org/neon4cast-targets/terrestrial_30min/terrestrial_30min-targets.csv.gz", guess_max = 1e6) |>
-  dplyr::filter(site_id == "NIWO")
+  dplyr::filter(site_id == site_id)
 
 ## build dat for Analysis
 nee = target |> filter(variable == "nee")
@@ -48,7 +50,7 @@ dat = data.frame(nep = -nee.reforecast$obs,
 
 ########  Get weather forecast ######
 dc = neon4cast::noaa_stage2() |>
-  dplyr::filter(site_id == "NIWO",
+  dplyr::filter(site_id == site_id,
                 variable %in% c("air_temperature","surface_downwelling_shortwave_flux_in_air"),
                 start_date == today_ch) |>
   dplyr::collect()
@@ -71,7 +73,7 @@ for(t in 1:nrow(inputs)){
 
 ######## reforecast met: stitch together first day of each weather forecast ######
 dr = neon4cast::noaa_stage3() |>
-  dplyr::filter(site_id == "NIWO",
+  dplyr::filter(site_id == site_id,
                   variable %in% c("air_temperature","surface_downwelling_shortwave_flux_in_air")) |>
   dplyr::collect()
 dr = dr |> 
@@ -128,19 +130,25 @@ out.f = ensemble_forecast(X = Analysis$X,           ## initial conditions = yest
 ######## Convert Forecast to standard & save ########
 dimnames(out.f) <- list(as.character(fx.time),as.character(1:ne),varnames)      ## label array dimensions
 fx = as.data.frame.table(out.f)                                                 ## reorganize into long format
-colnames(fx) = c("datetime","parameter","variable","prediction")                    ## label columns
+colnames(fx) = c("datetime","parameter","variable","prediction")                ## label columns
 fx2 = fx |> 
-  dplyr::filter(variable == "NEP",as.numeric(parameter) < 50) |>                ## thin forecast
-  dplyr::mutate(dplyr::across(variable, ~ str_replace_all(.x,'NEP', 'nee'))) |> ## rename
+  dplyr::filter(variable == "NEP") |>                                           ## scored variables
+  dplyr::mutate(dplyr::across(variable, ~ str_replace_all(.x,'NEP', 'nee'))) |> ## rename NEP -> NEE
   dplyr::mutate(prediction = -prediction) |>                                    ## change sign on NEE 
-  dplyr::mutate(reference_datetime = today_timestamp) |> relocate(reference_datetime)
-fx_file = file.path(outdir,
-                    paste0("terrestrial_30min_",today_ch,"_SSEM.csv")) ## output filename
-write_csv(fx,fx_file)
+  dplyr::mutate(reference_datetime = today_timestamp) |> relocate(reference_datetime) |> ## add reference_datetime
+  dplyr::mutate(site_id = site_id) |> relocate(site_id,.after=datetime) |>               ## add site_id
+  dplyr::mutate(family = "ensemble") |> relocate(family,.before=parameter) |>            ## add family
+  dplyr::mutate(datetime = lubridate::as_datetime(as.character(datetime))) |>            ## make sure datetime is formatted correctly
+  dplyr::mutate(parameter = as.numeric(parameter))                                       ## make sure parameter is formatted correctly
+
+## resample to make processing easier and eliminate the need to track weights
+param = sample(seq_along(Analysis$wt),n_submit,replace = TRUE,prob = Analysis$wt)
+fx3 = fx2 |> filter(parameter %in% param)
+
+## save to file
+setwd(outdir)
+fx_file = paste0("terrestrial_30min-",today_ch,"-SSEM.csv") ## output filename
+write_csv(fx2,fx_file)
 
 ######## Submit ########
-Sys.setenv("AWS_DEFAULT_REGION" = "data",
-           "AWS_S3_ENDPOINT" = "ecoforecast.org")
-
-aws.s3::put_object(object = fx_file, bucket = "submissions")
-#aws.s3::put_object(object = meta_file, bucket = "submissions")
+neon4cast::submit(forecast_file = fx_file, metadata = NULL, ask = FALSE)
