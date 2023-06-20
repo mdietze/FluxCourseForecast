@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    if: github.repository == 'mdietze/FluxCourseForecast'  ## update to your username
+#    if: github.repository == 'mdietze/FluxCourseForecast'  ## update to your username
     runs-on: ubuntu-latest
     container:
       image: rocker/geospatial
