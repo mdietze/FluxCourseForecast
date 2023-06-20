@@ -6,6 +6,7 @@ timestep = 3600       ## seconds, driven by timestep of met data
 site_id  = "NIWO"     ## NEON site code
 outdir   = "forecast" ## where should forecasts be saved locally before submitting
 dir.create(outdir,showWarnings = FALSE)
+dir.create("analysis",showWarnings = FALSE) ## should already exist
 ## ONE TIME: to initiate workflow, copy calibration analysis to day before start date
 ## e.g. cp analysis/2015-07-01.RDS analysis/2022-07-01.RDS
 
