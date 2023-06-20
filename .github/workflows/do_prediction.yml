@@ -19,4 +19,4 @@ jobs:
       - name: install R packages
         run: R -e 'source("install.R")' 
       - name: Run automatic prediction file
-        run: Rscript forecast_model.R
+        run: Rscript forecast.R
