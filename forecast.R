@@ -25,13 +25,12 @@ print(paste("last.date",last.date))
 today = Sys.time()
 today_timestamp = strptime(today, "%Y-%m-%d %H:%M:%S",tz="UTC")
 today_ch        = as.character(as.Date(today))
-yesterday       = as.Date(today_timestamp - lubridate::days(1))
 jumpBack = min(100,max(10,as.Date(today) - as.Date(last.date)-1))  ## how many days do we want go back to account for data latency?
 ## NOTE: max of 100 is arbitrary, system should happily jumpBack any amount of time
 ## TODO: improve min jumpBack (currently 10 days) by explicitly keeping track of last data assimilated
 start_date = lubridate::as_date(today)-lubridate::days(jumpBack)
 horiz       = 35 #days, forecast horizon during forecast
-print(paste("Run settings [today,yesterday,jumpBack,start_date]:",today,yesterday,jumpBack,start_date))
+print(paste("Run settings [today,jumpBack,start_date]:",today,yesterday,start_date))
 
 ######## Get latest increment of data (flux) ########
 target <- readr::read_csv("https://data.ecoforecast.org/neon4cast-targets/terrestrial_30min/terrestrial_30min-targets.csv.gz", guess_max = 1e6) |>
@@ -52,14 +51,23 @@ unc = predict.flux.uncertainty(nee.reforecast$obs,fu.params)
 dat = data.frame(nep = -nee.reforecast$obs,
                  sigma.nep = unc
 )
-print(paste("Available data constraints",dim(dat)))
+print(paste("Available data constraints",paste(dim(dat),collapse = ", ")))
 
 ########  Get weather forecast ######
+yesterdays       = as.character(as.Date(today_timestamp - lubridate::days(0:3))) ## looking for most recent fx
 dc = neon4cast::noaa_stage2() |>
   dplyr::filter(site_id == SITE_ID,
                 variable %in% c("air_temperature","surface_downwelling_shortwave_flux_in_air"),
-                start_date == as.character(yesterday)) |>   ## assuming that today's forecast hasn't posted yet
+                start_date %in% yesterdays) |>
   dplyr::collect()
+if(nrow(dc)==0){
+  print("NO WEATHER FORECAST DATA AVAILABLE, STOPPING")
+  stop()
+}
+## select most recent forecast
+fx.start = last(names(table(dc$start_date)))
+dc = dc |> dplyr::filter(start_date == fx.start)
+## organize for model
 met <- dc  |> pivot_wider(names_from = parameter,values_from = prediction)
 PAR = met |> 
   filter(variable == "surface_downwelling_shortwave_flux_in_air") |> 
@@ -76,21 +84,21 @@ for(t in 1:nrow(inputs)){
   inputs[t,is.na(inputs[t, ,"temp"]),"temp"] = mean(inputs[t, ,"temp"],na.rm = TRUE)
   inputs[t,is.na(inputs[t, ,"PAR" ]),"PAR"]  = mean(inputs[t, ,"PAR"],na.rm = TRUE)
 }
-print(paste("Available forecast meteorology:",dim(inputs)))
+print(paste("Available forecast meteorology:",paste(dim(inputs),collapse = ", ")))
 
 ######## reforecast met: stitch together first day of each weather forecast ######
 dr = neon4cast::noaa_stage3() |>
   dplyr::filter(site_id == SITE_ID,
                   variable %in% c("air_temperature","surface_downwelling_shortwave_flux_in_air")) |>
   dplyr::collect()
-print(paste("dr1",dim(dr)))
+print(paste("dr1",paste(dim(dr),collapse = ", ")))
 dr = dr |> 
   dplyr::filter(between(datetime,
                         lubridate::as_datetime(as.Date(today)-jumpBack),
-                        lubridate::as_datetime(today))) |> ## couldn't get between to work in initial query
+                        lubridate::as_datetime(fx.start))) |> ## couldn't get between to work in initial query
   na.omit() |>
   pivot_wider(names_from = parameter,values_from = prediction)
-print(paste("dr2",dim(dr)))
+print(paste("dr2",paste(dim(dr),collapse = ", ")))
 table(dr$site_id)
 table(dr$datetime)
 PAR = dr |> 
@@ -104,15 +112,19 @@ inputs.reforecast = array(dim=c(nrow(PAR),ne,2))
 dimnames(inputs.reforecast)[[3]] = c("temp","PAR")
 inputs.reforecast[,,"temp"] = temp[, Analysis$met] - 273.15  ## air temperature (Celsius)
 inputs.reforecast[,,"PAR"]  = PAR[, Analysis$met] / 0.486 ## gap filled PAR, conversion From Campbell and Norman p151
-print(paste("available reforecast inputs",dim(inputs.reforecast)))
+print(paste("available reforecast inputs",paste(dim(inputs.reforecast),collapse = ", ")))
 
-
-#########  REFORECAST  ############
+## date checking
 date = nee.reforecast$hour    ## used as time in reforecast
 date = seq(nee.reforecast$hour[1],today_timestamp,by=lubridate::seconds(timestep))
-print(paste("date",length(date),paste(range(date),collapse=",")))
+dr.days = table(as.Date(dr$datetime))
+dr.days = dr.days[-which(dr.days < 48)]
+print(paste("date: ",length(date),paste(range(date),collapse=", ")))
+print(dr.days)
+
+#########  REFORECAST  ############
 forecast <- array(NA,c(86400/timestep*jumpBack,ne,12)) ## output storage [time, ensemble, state]
-for(t in 1:(jumpBack-1)){
+for(t in seq_along(dr.days)){
   # counter to help us know things are still running
   print(start_date + lubridate::days(t-1))
   
@@ -135,7 +147,7 @@ for(t in 1:(jumpBack-1)){
                                  wt = Analysis$wt)
     newAnalysis$met = Analysis$met
     # Save the Analysis
-    saveRDS(newAnalysis,file=file.path("analysis",paste0(start_date+lubridate::days(t),".RDS")))
+    saveRDS(newAnalysis,file=file.path("analysis",paste0(start_date+lubridate::days(t-1),".RDS")))
   } else {
     print("skipping ParticleFilter")
     newAnalysis = Analysis
