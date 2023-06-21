@@ -176,7 +176,7 @@ fx3 = fx2 |> filter(parameter %in% param)
 setwd(outdir)
 fx_file = paste0("terrestrial_30min-",today_ch,"-SSEM.csv") ## output filename
 write_csv(fx2,fx_file)
-#setwd("..")
 
 ######## Submit ########
 neon4cast::submit(forecast_file = fx_file, metadata = NULL, ask = FALSE)
+setwd("..")
