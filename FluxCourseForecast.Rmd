@@ -426,8 +426,8 @@ To be able to submit the forecast to the NEON challenge, we need to reorganize t
 ## reorganize data in long format
 dimnames(output.ensemble) <- list(as.character(date[today]),as.character(1:ne),varnames) ## label array dimensions
 fx = as.data.frame.table(output.ensemble)                                       ## reorganize into long foremat
-colnames(fx) = c("time","ensemble","variable","prediction")                     ## label columns
-fx_file = file.path(outdir,paste0("terrestrial_30min_",start_date,"_SSEM.csv")) ## output filename
+colnames(fx) = c("datetime","ensemble","variable","prediction")                 ## label columns
+fx_file = file.path(outdir,paste0("terrestrial_30min-",start_date,"-SSEM.csv")) ## output filename
 write_csv(fx,fx_file)
 head(fx)
 
@@ -549,18 +549,16 @@ write_eml(my_eml, meta_file)
 
 example of how you would submit the forecast to the EFI NEON challenge (by default, doesn't actually run)
 ```
-Sys.setenv("AWS_DEFAULT_REGION" = "data",
-           "AWS_S3_ENDPOINT" = "ecoforecast.org")
-
-aws.s3::put_object(object = fx_file, bucket = "submissions")
-aws.s3::put_object(object = meta_file, bucket = "submissions")
+neon4cast::submit(forecast_file = fx_file, metadata = NULL, ask = FALSE)
 ```
 
 # Run an actual forecast!
 
-* Run the forecast into the future using forecast meteorology (EFI provides NOAA GEFS 35 day, 31 ensemble)
-
-Note that met variables are now matrices of ensemble members that need to be sampled over!
+* The script forecast.R runs the forecast into the future using forecast meteorology (EFI provides NOAA GEFS 35 day, 31 ensemble)
+* To set up, copy the date-stamped Analysis RDS file that you want to start off from (state and parameter initial conditons) into the `analysis` folder and change the date to the date you want to start forecasting from
+* Met variables are now matrices of ensemble members that need to be sampled over!
+* Every day we predict 35 days into the future, so we end up forecasting every date 35 times (with different lead times) rather than just once as we did above.
+* Because of the latency in the NEON data we alse end up "reforecasting" the past few days to catch and assimilate any new observations that may have shown up since our last forecast
 
 
 # Workflow automation
@@ -578,7 +576,8 @@ A video providing more information about how to use GitHub actions for automated
 
 # Next steps
 
-* Additional data constraints (e.g. MODIS LAI)
-* Additional sites
+* Additional sites: EFI provides met and targets for all 47 NEON tower sites. Extending beyond these is possible but required nontrivial time spent on data processing.
+* Additional data constraints to the Particle Filter's Likelihood: Things that work particularly well are sensor-based observations that become available frequently (e.g., MODIS LAI, SMAP, soil respiration)
+* Modify/improve the model: Lots of assumptions in SSEM are known to be false!
 * Longer calibration (do parameters vary by season? by year?)
 
