@@ -30,7 +30,7 @@ jumpBack = min(100,max(10,as.Date(today) - as.Date(last.date)-1))  ## how many d
 ## TODO: improve min jumpBack (currently 10 days) by explicitly keeping track of last data assimilated
 start_date = lubridate::as_date(today)-lubridate::days(jumpBack)
 horiz       = 35 #days, forecast horizon during forecast
-print(paste("Run settings [today,jumpBack,start_date]:",today,yesterday,start_date))
+print(paste("Run settings [today,jumpBack,start_date]:",today,jumpBack,start_date))
 
 ######## Get latest increment of data (flux) ########
 target <- readr::read_csv("https://data.ecoforecast.org/neon4cast-targets/terrestrial_30min/terrestrial_30min-targets.csv.gz", guess_max = 1e6) |>
