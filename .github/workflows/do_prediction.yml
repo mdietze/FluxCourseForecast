@@ -26,16 +26,12 @@ jobs:
       - name: Run automatic prediction file
         run: Rscript forecast.R
       - name: Commit changes
-        run: |
-        git add analysis/*.RDS
-        git commit -m "update Analyis ${GITHUB_SHA}" || true
-#        git config --global user.email "dietze@bu.edu"
-#        git config --global user.name "mdietze"
-        #       uses: EndBug/add-and-commit@v9
-#        with:
-#          add: 'analysis/*.RDS'
-#          author_name: Michael Dietze
-#          author_email: dietze@bu.edu
+        run: 	git config --global --add safe.directory /__w/FluxCourseForecast/FluxCourseForecast
+      - uses: EndBug/add-and-commit@v9
+        with:
+          add: 'analysis/*.RDS'
+          author_name: Michael Dietze
+          author_email: dietze@bu.edu
 #        uses: stefanzweifel/git-auto-commit-action@v4
 #          with:
 #            file_pattern: 'analysis/*.RDS'
