@@ -26,3 +26,5 @@ jobs:
         uses: EndBug/add-and-commit@v9
         with:
           add: 'analysis/*.RDS'
+          author_name: Michael Dietze
+          author_email: dietze@bu.edu
