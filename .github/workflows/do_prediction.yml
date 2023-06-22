@@ -1,8 +1,8 @@
 on:
   workflow_dispatch:
-#  schedule:
-#  - cron: "0 20 * * *"
-#  push:
+  schedule:
+  - cron: "0 20 * * *"
+  push:
 
 
 jobs:
@@ -22,3 +22,7 @@ jobs:
         run: R -e 'source("install.R")' 
       - name: Run automatic prediction file
         run: Rscript forecast.R
+      - name: Commit changes
+        uses: EndBug/add-and-commit@v9
+        with:
+          add: 'analysis/*.RDS'
