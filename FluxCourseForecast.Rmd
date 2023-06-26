@@ -223,10 +223,10 @@ ensemble_forecast
 
 *Run first forecast*
 ```{r}
-dayInputs = inputs %>% filter(date >= start_date, date < start_date + horiz_calib)
+dayInputs = inputs %>% dplyr::filter(date >= start_date, date < start_date + lubridate::days(horiz_calib))
 output.ensemble = ensemble_forecast(X = X.orig,
                                     params = params,
-                                    inputs = dayInputs) 
+                                    inputs = dayInputs[,2:3]) ## don't feed date col'n to model 
 ```
 
 *Plot timeseries*
@@ -335,7 +335,7 @@ for(t in 1:ndays){
   # Today's forecast
   out = ensemble_forecast(X = Analysis[[t]]$X,           ## initial conditions = yesterday's Analysis
                           params = Analysis[[t]]$params, ## today's parameters = yesterday's Analysis
-                          inputs = inputs[today,])       ## today's subset of meteorology     
+                          inputs = inputs[today,2:3])    ## today's subset of meteorology     
   forecast[today-t0+1,,] = out                           ## store today's forecast in overall array
   
   # Today's data constraints

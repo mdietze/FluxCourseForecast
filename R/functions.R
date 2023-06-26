@@ -16,11 +16,6 @@ SSEM.orig <- function(X, params, inputs, timestep = 1800){
   LAI = X[, 1] * params$SLA * 0.1  #0.1 is conversion from Mg/ha to kg/m2
   GPP = pmax(0, params$alpha * (1 - exp(-0.5 * LAI)) * inputs$PAR)
   GPP[inputs$PAR < 1e-20] = 0 ## night
-  # if(inputs$PAR > 1e-20){
-  #   GPP = pmax(0, params$alpha * (1 - exp(-0.5 * LAI)) * inputs$PAR)
-  # } else {
-  #   GPP = rep(0, ne)
-  # }
   
   ## respiration & allocation
   alloc = GPP *   params[,c("falloc.1","falloc.2","falloc.3")] ## Ra, NPPwood, NPPleaf
@@ -51,10 +46,11 @@ SSEM <- compiler::cmpfun(SSEM.orig)  ## byte compile the function to make it fas
 ##` @param inputs   model drivers (air temperature, PAR)
 ensemble_forecast <- function(X,params,inputs){
   nt = nrow(inputs)
-  output = array(0.0, c(nt, ne, 12))     ## output storage [time step,ensembles,variables]
-  if(length(dim(inputs)) < 3){ ## add ens dim to non-ensemble met
-    i2 = array(inputs,dim=c(nrow(inputs),1,2)) ## [time,ensemble,variable]
-    dimnames(i2)[[3]] = colnames(inputs)
+  output = array(0.0, c(nt, ne, 12))        ## output storage [time step,ensembles,variables]
+  if(length(dim(inputs)) < 3){              ## add ens dim to non-ensemble met
+    i2 = array(NA,dim=c(nrow(inputs),ne,2)) ## [time,ensemble,variable]
+    for(i in 1:ne) i2[,i,] = as.matrix(inputs) ## replicate inputs for every ensemble member
+    dimnames(i2)[[3]] = colnames(inputs)    ## copy over column names
     inputs = i2
   }
   
