@@ -91,16 +91,12 @@ dr = neon4cast::noaa_stage3() |>
   dplyr::filter(site_id == SITE_ID,
                   variable %in% c("air_temperature","surface_downwelling_shortwave_flux_in_air")) |>
   dplyr::collect()
-print(paste("dr1",paste(dim(dr),collapse = ", ")))
 dr = dr |> 
   dplyr::filter(between(datetime,
                         lubridate::as_datetime(as.Date(today)-jumpBack),
                         lubridate::as_datetime(fx.start))) |> ## couldn't get between to work in initial query
   na.omit() |>
   pivot_wider(names_from = parameter,values_from = prediction)
-print(paste("dr2",paste(dim(dr),collapse = ", ")))
-table(dr$site_id)
-table(dr$datetime)
 PAR = dr |> 
   filter(variable == "surface_downwelling_shortwave_flux_in_air") |> 
   select(-(1:7)) |> as.matrix()
@@ -119,8 +115,6 @@ date = nee.reforecast$hour    ## used as time in reforecast
 date = seq(nee.reforecast$hour[1],today_timestamp,by=lubridate::seconds(timestep))
 dr.days = table(as.Date(dr$datetime))
 dr.days = dr.days[-which(dr.days < 48)]
-print(paste("date: ",length(date),paste(range(date),collapse=", ")))
-print(dr.days)
 
 #########  REFORECAST  ############
 forecast <- array(NA,c(86400/timestep*jumpBack,ne,12)) ## output storage [time, ensemble, state]
