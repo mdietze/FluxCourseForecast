@@ -3,7 +3,10 @@ library(tidyverse)
 source("R/functions.R")
 n_submit = 50         ## sample size of ensemble members submitted to EFI
 timestep = 3600       ## seconds, driven by timestep of met data
-SITE_ID  = "NIWO"     ## NEON site code
+#SITE_ID  = "NIWO"     ## NEON site code
+targets <- readr::read_csv("https://data.ecoforecast.org/neon4cast-targets/terrestrial_30min/terrestrial_30min-targets.csv.gz", guess_max = 1e6)
+sites <- unique(targets$site_id)
+
 outdir   = "forecast" ## where should forecasts be saved locally before submitting
 dir.create(outdir,showWarnings = FALSE)
 dir.create("analysis",showWarnings = FALSE) ## should already exist
@@ -28,12 +31,21 @@ today_ch        = as.character(as.Date(today))
 jumpBack = min(100,max(10,as.Date(today) - as.Date(last.date)-1))  ## how many days do we want go back to account for data latency?
 ## NOTE: max of 100 is arbitrary, system should happily jumpBack any amount of time
 ## TODO: improve min jumpBack (currently 10 days) by explicitly keeping track of last data assimilated
+
+
 start_date = lubridate::as_date(today)-lubridate::days(jumpBack)
 horiz       = 35 #days, forecast horizon during forecast
 print(paste("Run settings [today,jumpBack,start_date]:",today,jumpBack,start_date))
 
+
+
+fx_all <- list()
+
+for(i in seq_along(sites)) {
+SITE_ID <- sites[[i]]
+# terrestrial_forecast <- function (SITE_ID) {
 ######## Get latest increment of data (flux) ########
-target <- readr::read_csv("https://data.ecoforecast.org/neon4cast-targets/terrestrial_30min/terrestrial_30min-targets.csv.gz", guess_max = 1e6) |>
+target <- targets |>
   dplyr::filter(site_id == SITE_ID)
 
 ## build dat for Analysis
@@ -178,11 +190,26 @@ fx2 = fx |>
 param = sample(seq_along(Analysis$wt),n_submit,replace = TRUE,prob = Analysis$wt)
 fx3 = fx2 |> filter(parameter %in% param)
 
+# we could save RAM here by writing out in append mode.
+fx_all[[i]] <- fx3
+
+}
+
+# instead of a loop we could have used a map:
+#fx_all <- purrr::map(sites, terrestrial_forecast) 
+
 ## save to file
 setwd(outdir)
-fx_file = paste0("terrestrial_30min-",today_ch,"-SSEM.csv") ## output filename
-write_csv(fx2,fx_file)
+# use compression for 6x savings :-)
+fx_file = paste0("terrestrial_30min-",today_ch,"-SSEM.csv.gz") ## output filename
+purrr::list_rbind(fx_all) |> write_csv(fx_file)
+
+
+
+
 
 ######## Submit ########
 neon4cast::submit(forecast_file = fx_file, metadata = NULL, ask = FALSE)
 setwd("..")
+
+
