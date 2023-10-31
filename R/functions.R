@@ -87,7 +87,7 @@ smooth.params <- function(params,h=1){
   return(params.star)
 }
 
-##` Particile filter
+##` Particle filter
 ##` Updates state and parameter weights based on likelihood of the data
 ##` Will resample-move if effective sample size drops to <50%
 ##`
@@ -113,13 +113,19 @@ ParticleFilter <- function(out,params,dat,wt=1){
     }
     mult = mult*2 
   }
-  wt = like * wt ## update weights
+  new_wt = like * wt ## update weights
   
+  if ( all(new_wt == 0) ){
+    new_wt = (like/sum(like)) * (wt / sum(wt))
+  }
+  wt = new_wt
   ## hist(wt,main="Ensemble Weights")  ## useful diagnostic if you're running line-by-line
   
   ## calculate effective sample size
   wtn = wt/sum(wt)          ## normalized weights
   Neff = 1/sum(wtn^2)
+  
+  
   
   ## check if effective size has dropped below 50% threshold
   if(Neff < ne/2){
