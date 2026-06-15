@@ -32,9 +32,11 @@
 ##   All checks should report [PASS].
 
 ## ── Set your site and year here ───────────────────────────────────────────────
-site_id  <- "US-NR1"    # AmeriFlux site ID matching download_site.R
-year     <- 2015        # year to filter to (Mike's Rmd uses US-NR1 2015)
-data_dir <- "data"      # path to the data folder (relative to project root)
+## When sourced from FluxCourseSiteExplorer.Rmd, site_id, year, and data_dir
+## are set in the calling environment from params; the guards below preserve them.
+if (!exists("site_id"))  site_id  <- "US-NR1"  # AmeriFlux site ID matching download_site.R
+if (!exists("year"))     year     <- 2015       # year to filter to (Mike's Rmd uses US-NR1 2015)
+if (!exists("data_dir")) data_dir <- "data"     # path to the data folder (relative to project root)
 ## ─────────────────────────────────────────────────────────────────────────────
 
 ## ---------------------------------------------------------------------------

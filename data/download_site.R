@@ -30,8 +30,10 @@
 ## The raw ZIP and unzipped files go to data/{site_id}/raw/ (gitignored).
 
 ## ── Set your site here ────────────────────────────────────────────────────────
-site_id <- "US-NR1"    # Change to any valid AmeriFlux or ICOS site ID
-year    <- 2015        # Year you plan to use for the exercise
+## When sourced from FluxCourseSiteExplorer.Rmd, site_id and year are set in
+## the calling environment from params; the guards below preserve those values.
+if (!exists("site_id")) site_id <- "US-NR1"  # Change to any valid AmeriFlux or ICOS site ID
+if (!exists("year"))    year    <- 2015       # Year you plan to use for the exercise
 ##              (Mike Dietze's FluxCourseModelCalib.Rmd uses US-NR1, 2015)
 ## ─────────────────────────────────────────────────────────────────────────────
 

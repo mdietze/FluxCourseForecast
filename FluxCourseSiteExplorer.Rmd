@@ -1,0 +1,775 @@
+---
+title: "Flux Course 2026: Site Explorer"
+subtitle: "Run the SSEM calibration exercise at any FLUXNET site"
+author: "Michael Dietze & David Moore"
+output: html_document
+params:
+  site_id: "US-MMS"
+  year: 2008
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(compiler)
+library(tidyverse)
+have_GA <- requireNamespace("GA", quietly = TRUE)  ## GA is optional; Section 4.2 skipped if absent
+if (have_GA) library(GA) else message("GA package not found — Section 4.2 (GA calibration) will be skipped.\nInstall with: install.packages('GA')")
+source("R/functions.R")
+source("R/utils.R")
+
+## Ensemble size — increase to 200–5000 on a fast machine
+ne <- 100
+
+## Nominal timestep placeholder; prepare_site.R will auto-detect from the data
+timestep <- 1800  # seconds; 1800 = half-hourly, 3600 = hourly
+
+## Pull site and year from knit parameters (or defaults if run interactively)
+site_id <- params$site_id
+year    <- params$year
+
+cat("Date:",   format(Sys.time(), "%Y-%m-%d %H:%M"), "\n")
+cat("Commit:", tryCatch(system("git rev-parse --short HEAD", intern = TRUE),
+                        error = function(e) "unknown"), "\n")
+cat("Site:", site_id, "| Year:", year, "| ne:", ne, "\n")
+```
+
+---
+
+# Site Explorer: `r params$site_id`, `r params$year`
+
+This document lets you run the full SSEM model calibration exercise developed by
+Mike Dietze (Boston University) at **any FLUXNET site** — not just the US-NR1
+example used during the course. It is self-contained: it downloads data if needed,
+builds the prior, runs the model, calibrates it, and compares the result to
+upscaled FLUXCOM estimates and CMIP6 Earth system model output where those data
+are available.
+
+To run this for a different site or year:
+
+```r
+rmarkdown::render("FluxCourseSiteExplorer.Rmd",
+                  params = list(site_id = "US-NR1", year = 2015))
+```
+
+---
+
+# 1. Download site data
+
+If the processed CSV for this site does not already exist, we download the
+FLUXNET FULLSET product using the EcosystemEcologyLab fluxnet package.
+Downloading and unzipping can take 5–30 minutes depending on site record length
+and network speed. The raw ZIP is saved to `data/{site_id}/raw/` (git-ignored);
+the processed HH/HR CSV lands in `data/{site_id}/`.
+
+```{r download-data}
+## Look for the half-hourly (HH) or hourly (HR) processed CSV
+hh_path <- file.path("data", site_id, paste0(site_id, "_HH.csv"))
+hr_path <- file.path("data", site_id, paste0(site_id, "_HR.csv"))
+
+if (file.exists(hh_path) || file.exists(hr_path)) {
+  cat("Data already present for", site_id, "-- skipping download.\n")
+} else {
+  message("Downloading ", site_id, " from FLUXNET shuttle...\n",
+          "This may take several minutes for a new site.")
+  source("data/download_site.R")
+}
+```
+
+---
+
+# 2. Prepare site data
+
+`prepare_site.R` reads the downloaded CSV and constructs every R object that the
+calibration workflow requires. It handles both HH (30-min) and HR (60-min) time
+steps automatically, selects ERA5 reanalysis drivers when available, and creates
+a unified `flux$NEE_REF` column that works whether the site product provides
+`NEE_VUT_REF` (variable u\* threshold) or `NEE_CUT_REF` (constant u\* threshold).
+
+```{r prepare-data}
+## rmarkdown locks the 'params' binding in the global environment for parameterized
+## reports. prepare_site.R needs to create its own 'params' data.frame (the SSEM
+## model parameter ensemble), so we unlock the binding first and stash the Rmd
+## params in a private variable.
+.rmd_params <- params
+if (bindingIsLocked("params", globalenv())) unlockBinding("params", globalenv())
+source("data/prepare_site.R")
+## After sourcing, 'params' is the [ne x 9] SSEM parameter ensemble data.frame.
+## site_id and year were set in the setup chunk and preserved by prepare_site.R's
+## if(!exists()) guards.
+
+## After sourcing, the following objects exist in the global environment:
+##   flux        — FLUXNET data frame for the target year
+##   date        — POSIXct timestamp vector
+##   inputs      — data frame with date, temp (°C), PAR (umol/m2/s)
+##   nep         — Net Ecosystem Production = -NEE (umol/m2/s)
+##   nep.qc      — QC flag (0 = measured, 1–3 = gap-filled)
+##   nep.unc     — joint uncertainty on NEE (umol/m2/s)
+##   X, X.orig   — [ne × 3] initial C pool ensemble (Mg/ha)
+##   params      — [ne × 9] prior parameter ensemble
+
+## timestep is auto-detected by prepare_site.R; update ts_per_day accordingly
+ts_per_day <- round(86400 / timestep)  # number of model steps per 24 h
+cat("Timestep:", timestep, "s — aggregating", ts_per_day,
+    "steps per day for daily plots.\n")
+```
+
+---
+
+# 3. Forward run and pre-calibration assessment
+
+## 3.1 Model structure
+
+The SSEM (Super Simple Ecosystem Model) is a three-pool carbon cycle model.
+Its state variables are leaf biomass (X[,1]), structural biomass (X[,2]), and
+soil organic matter (X[,3]), all in Mg C ha^-1^. Two drivers — PAR and air
+temperature — control photosynthesis and soil respiration respectively.
+
+```{r show-model}
+SSEM.orig
+```
+
+**Task:** Before running the model forward, look at the equations. What processes
+are represented? What is missing? What simplifying assumptions might cause problems
+at your site (e.g., water limitation in a semi-arid ecosystem, permafrost dynamics
+at high-latitude sites)?
+
+## 3.2 Initial conditions (prior)
+
+```{r plot-ic}
+pool.lab <- c("leaf", "wood", "SOM")
+for (i in 1:3) {
+  hist(X[, i], main = paste(site_id, pool.lab[i], "prior"), xlab = "Mg C/ha")
+}
+```
+
+## 3.3 Prior parameter distributions
+
+```{r plot-params, fig.asp=1}
+plot_params(params)
+```
+
+## 3.4 Forward ensemble run (Monte Carlo error propagation)
+
+We run `ne` = `r ne` ensemble members forward through time. Each member samples
+a different combination of initial conditions and parameter values, so the spread
+of trajectories represents our prior uncertainty about the model's behaviour.
+
+```{r forward-run}
+system.time({
+  output.ensemble <- SSEM(X     = X.orig,
+                          params = params,
+                          inputs = inputs,
+                          verbose = TRUE)
+})
+```
+
+*Plot all pools and fluxes*
+
+```{r plot-forecast}
+plot_forecast(output.ensemble, sample = 5, timestep = ts_per_day)
+```
+
+**Task:** Examine the ensemble trajectories for each pool and flux.
+
+* Are the carbon pools and fluxes the right order of magnitude for your site?
+* Do the seasonal cycles have the right shape, timing, and amplitude?
+* Are the 95% intervals wide or narrow? Does the model appear over- or under-confident?
+* Which variables show the most inter-member spread — what does that tell you about
+  where the model is most sensitive to its parameter/initial condition uncertainty?
+
+## 3.5 Assessment against eddy covariance NEP
+
+```{r assessment}
+## Extract the ensemble NEP (variable 6) and compute the 95% CI
+ci <- apply(output.ensemble[, , 6], 1, quantile, c(0.025, 0.5, 0.975))
+
+## Raw half-hourly (or hourly) time series — colours show QC level
+ylim <- range(c(range(ci), range(nep, na.rm = TRUE)))
+plot(inputs$date, ci[2, ], ylim = ylim, col = 1, pch = 18, cex = 0.2,
+     xlab = "Date", ylab = "NEP (umol/m2/s)",
+     main = paste(site_id, year, "— raw timeseries (pre-calibration)"))
+ciEnvelope(inputs$date, ci[1, ], ci[3, ], col = col.alpha("lightGrey", 0.5))
+points(inputs$date, nep, col = nep.qc + 2, cex = 0.02)
+legend("topright", legend = c("model", paste("QC", 0:3)),
+       pch = c(18, rep(1, 4)), col = c(1, 2:5))
+
+## Predicted vs observed scatter
+plot(ci[2, ], nep, col = nep.qc + 1, cex = 0.2,
+     xlab = "Model NEP (umol/m2/s)", ylab = "Obs NEP (umol/m2/s)",
+     main = paste(site_id, year, "— predicted vs observed (pre-calibration)"))
+abline(0, 1, lty = 2)
+
+## Daily time series
+date_daily  <- as_date(inputs$date)
+daily.nep   <- tapply(nep, date_daily, mean, na.rm = TRUE)
+daily.orig  <- apply(output.ensemble[, , 6], 2,
+                     function(x) tapply(x, date_daily, mean, na.rm = TRUE))
+daily.orig.ci <- apply(daily.orig, 1, quantile, c(0.025, 0.5, 0.975))
+
+ylim <- range(c(range(daily.orig.ci), range(daily.nep, na.rm = TRUE)))
+doy  <- sort(unique(date_daily))
+plot(doy, daily.orig.ci[2, ], ylim = ylim, col = 1, pch = 18, cex = 0.5,
+     xlab = "Date", ylab = "Daily NEP (umol/m2/s)",
+     main = paste(site_id, year, "— daily timeseries (pre-calibration)"))
+ciEnvelope(doy, daily.orig.ci[1, ], daily.orig.ci[3, ],
+           col = col.alpha("lightGrey", 0.5))
+points(doy, daily.nep, col = 2, cex = 0.5)
+legend("topright", legend = c("data", "orig"), pch = c(1, 18), col = c(2, 1))
+
+## Daily predicted vs observed
+plot(daily.orig.ci[2, ], daily.nep, ylim = ylim, xlim = ylim,
+     xlab = "Model daily NEP", ylab = "Obs daily NEP",
+     main = "Daily predicted vs observed")
+abline(0, 1, col = 2, lty = 2)
+
+## Mean diurnal cycle
+## Note: the -5 offset below corrects for UTC-5 (US Eastern/Central sites).
+## Adjust for your site's UTC offset if needed.
+tod          <- inputs$date - as.POSIXct(date_daily) - 5
+nep.diurnal  <- tapply(nep, tod, mean, na.rm = TRUE)
+time.of.day  <- as.numeric(names(nep.diurnal))
+orig.diurnal <- tapply(ci[2, ], tod, mean, na.rm = TRUE)
+
+ylim <- range(range(orig.diurnal), range(nep.diurnal, na.rm = TRUE))
+plot(time.of.day, nep.diurnal, col = 2, ylim = ylim,
+     xlab = "Time of day (s since midnight, UTC-5)",
+     ylab = "NEP (umol/m2/s)",
+     main = paste(site_id, "— mean diurnal curve (pre-calibration)"))
+lines(time.of.day, orig.diurnal)
+legend("topright", legend = c("data", "orig"), pch = c(1, NA),
+       lty = c(NA, 1), col = c(2, 1))
+
+## Functional response: NEP vs air temperature
+nbin <- 25
+Tair <- inputs$temp
+xd   <- seq(min(Tair, na.rm = TRUE), max(Tair, na.rm = TRUE), length = nbin)
+xmid <- xd[-length(xd)] + diff(xd)
+bin  <- cut(Tair, xd)
+Tbar.obs <- tapply(nep,     bin, mean, na.rm = TRUE)
+Tbar.mod <- tapply(ci[2, ], bin, mean, na.rm = TRUE)
+rng <- range(rbind(Tbar.obs, Tbar.mod), na.rm = TRUE)
+plot(xmid, Tbar.obs, col = "red", ylim = rng, type = "l",
+     xlab = "Air Temperature (°C)", ylab = "NEP (umol/m2/s)", cex.lab = 1.3,
+     main = paste(site_id, "— NEP vs temperature (pre-calibration)"))
+lines(xmid, Tbar.mod, col = "black", lwd = 4)
+legend("topleft", legend = c("Model", "Data"), lwd = 10, col = 1:2,
+       lty = 1, cex = 1.7)
+
+## Functional response: NEP vs PAR
+PAR  <- inputs$PAR
+xd   <- seq(min(PAR, na.rm = TRUE), max(PAR, na.rm = TRUE), length = nbin)
+xmid <- xd[-length(xd)] + diff(xd)
+bin  <- cut(PAR, xd)
+Pbar.obs <- tapply(nep,     bin, mean, na.rm = TRUE)
+Pbar.mod <- tapply(ci[2, ], bin, mean, na.rm = TRUE)
+rng <- range(rbind(Pbar.obs, Pbar.mod), na.rm = TRUE)
+plot(xmid, Pbar.obs, col = "red", ylim = rng, type = "l",
+     xlab = "PAR (umol/m2/s)", ylab = "NEP (umol/m2/s)", cex.lab = 1.3,
+     main = paste(site_id, "— NEP vs PAR (pre-calibration)"))
+lines(xmid, Pbar.mod, col = "black", lwd = 4)
+legend("topleft", legend = c("Model", "Data"), lwd = 10, col = 1:2,
+       lty = 1, cex = 1.7)
+```
+
+**Task:** What have you learned about the model from comparing it to data at your
+site?
+
+* Are there errors that suggest parameter misspecification? Do you have specific
+  predictions about which parameters need to move and in which direction?
+* Are there features of the plots (e.g., a systematic bias at certain temperatures
+  or PAR levels) that suggest model structural errors that calibration cannot fix?
+* How do the patterns at your site compare to the US-NR1 example shown in class?
+  What might explain the differences?
+
+## 3.6 Quantitative skill scores (pre-calibration)
+
+In addition to visual assessment, quantitative skill metrics help you track
+whether calibration is actually improving the model and by how much.
+
+```{r skill-pre}
+## Use only directly measured observations (QC = 0) for skill assessment
+qaqc <- (nep.qc == 0)
+E    <- ci[2, qaqc]   # model expected value
+O    <- nep[qaqc]     # observed
+
+## Regression
+NEE.pre.fit <- lm(O ~ E)
+
+## Build stats table — leave post row blank for now
+stats <- as.data.frame(matrix(NA, 2, 5))
+colnames(stats) <- c("RMSE", "Bias", "cor", "slope", "R-squared")
+rownames(stats) <- c("pre", "post")
+
+stats["pre", "RMSE"]      <- sqrt(mean((E - O)^2))
+stats["pre", "Bias"]      <- mean(E - O)
+stats["pre", "cor"]       <- cor(E, O)
+stats["pre", "slope"]     <- coef(NEE.pre.fit)[2]
+stats["pre", "R-squared"] <- summary(NEE.pre.fit)$r.squared
+
+knitr::kable(stats, digits = 4,
+             caption = paste(site_id, year,
+                             "— model skill (pre-calibration row filled)"))
+```
+
+If you liked model skill scores, you might also like:
+
+* Taylor Diagrams
+* Continuous Rank Probability Score (CRPS) and log score
+* [EF Activities — Model Assessment](https://github.com/EcoForecast/EF_Activities/blob/d92d8a44ee9d654ccbee569d9be3674821402a5c/Exercise_11_ModelAssessment.Rmd#L105)
+
+---
+
+# 4. Sensitivity analysis
+
+A one-at-a-time (OAT) sensitivity analysis shows how model outputs change as each
+parameter is varied while all others are held at their ensemble mean. The output
+here focuses on mean NEP and four error metrics (RMSE, bias, correlation).
+
+```{r sensitivity, cache=TRUE}
+sa.summary <- nee.sensitivity(ns = 10)
+vname <- c("param", "mean", "RMSE", "Bias", "cor")
+```
+
+```{r sens-plot, fig.asp=1}
+## Sensitivity of mean NEP — slope = elasticity (standardised sensitivity)
+sens <- sens_plot(var = 2)
+
+## Ranked elasticity table
+knitr::kable(sens[order(abs(sens), decreasing = TRUE)],
+             caption = "Ranked elasticities (standardised sensitivities)")
+```
+
+**Task:**
+
+* Which parameters are most sensitive at your site? Which are least?
+* Which are positively associated with NEP? Negatively? Does that make ecological sense?
+* Are any sensitivity curves strongly nonlinear? What does that imply for calibration?
+
+```{r sens-error, fig.asp=1}
+## Cost function landscapes for each parameter
+sens_plot(var = 3, line = FALSE)  # RMSE (minimise)
+sens_plot(var = 4, line = FALSE)  # Bias (want ≈ 0)
+sens_plot(var = 5, line = FALSE)  # Correlation (maximise)
+```
+
+**Task:**
+
+* For each metric, what score would indicate perfect model performance?
+* Which parameters show a clear optimum? Which are flat (insensitive)?
+* Do the three metrics agree on which direction parameters need to move?
+
+## 4.1 Likelihood function
+
+The likelihood function formalises the cost function idea: it is the probability
+of observing the data given a specific set of model parameters. Here we use a
+Normal likelihood, assuming independent Gaussian residuals.
+
+```{r likelihood}
+likelihood <- function(param, Obs) {
+  param <- data.frame(t(param))
+  colnames(param) <- c(colnames(params), "sigma")
+  Model <- SSEM(X      = Xbar,
+                params = param[, 1:9],
+                inputs = inputs[, 2:3])
+  lnL <- sum(dnorm(Obs, Model[, , 6], sd = param[1, 10], log = TRUE),
+             na.rm = TRUE)
+  return(lnL)
+}
+
+## Parameter mean vector and ranges for optimisation
+theta_bar          <- t(apply(params, 2, mean))
+theta_bar[10]      <- stats["pre", "RMSE"]
+theta_range        <- apply(params, 2, range)
+theta_range        <- cbind(theta_range, sigma = c(0, 10))
+Xbar               <- matrix(apply(X.orig, 2, mean), nrow = 1)
+
+## Baseline log-likelihood at prior means (sanity check — should not be NA/Inf)
+L0 <- likelihood(param = theta_bar, Obs = nep)
+cat("Log-likelihood at prior means:", round(L0, 2), "\n")
+```
+
+## 4.2 Genetic Algorithm calibration (optional — slow)
+
+The GA searches for the Maximum Likelihood Estimate (MLE). This can take 10–30
+minutes. The result is cached to a site- and year-specific file so re-knitting
+is fast.
+
+```{r ga-calibration, cache=TRUE, eval=have_GA}
+fit_file <- paste0("fitGA_", site_id, "_", year, ".RData")
+
+if (file.exists(fit_file)) {
+  load(fit_file)
+  cat("Loaded cached GA result from", fit_file, "\n")
+} else {
+  message("Running GA calibration for ", site_id, " — this may take 10–30 min.")
+  fitted_model <- GA::ga(
+    type     = "real-valued",
+    fitness  = likelihood,
+    lower    = theta_range[1, ],
+    upper    = theta_range[2, ],
+    Obs      = nep,
+    parallel = TRUE,
+    popSize  = 30,
+    maxiter  = 50,
+    run      = 10,
+    pmutation = 0.2
+  )
+  save(fitted_model, file = fit_file)
+}
+
+summary(fitted_model)
+params_MLE <- as.data.frame(fitted_model@solution)
+```
+
+If you liked MLE, you may also like:
+
+* Markov Chain Monte Carlo (MCMC) — JAGS, NIMBLE, BayesianTools
+* Hamiltonian Monte Carlo — Stan
+* Sobol sensitivity analysis to reduce the parameter dimension before calibration
+
+---
+
+# 5. EKI calibration
+
+Ensemble Kalman Inversion (EKI) is an ensemble-based approach to calibration that
+is much faster than MCMC or GA for this model. Instead of evaluating thousands of
+parameter proposals sequentially, EKI runs all ensemble members in parallel and
+nudges the ensemble mean and covariance toward lower error. We iterate 4 times,
+picking the iteration with the lowest RMSE.
+
+```{r eki, cache=TRUE}
+output  <- list()
+param   <- list(first = params)
+RMSE    <- 0
+lambda  <- 1.2  # variance inflation factor: keeps the ensemble from collapsing too fast
+
+## Run all ensemble members at the mean initial condition to reduce noise
+Xbar <- matrix(apply(X.orig, 2, mean), nrow = ne, ncol = 3, byrow = TRUE)
+
+for (i in 1:4) {
+  print(i)
+  output[[i]]  <- SSEM(Xbar, param[[i]], inputs)
+  RMSE[i]      <- sqrt(mean((output[[i]][, , 6] - nep)^2, na.rm = TRUE))
+  param[[i+1]] <- EKI(output[[i]][, , 6], Obs = nep,
+                       param[[i]], sigma = RMSE[i] * lambda)
+  param[[i+1]] <- impose.contraints(param[[i+1]], params)
+}
+
+## Final iteration
+output[[i+1]] <- SSEM(Xbar, param[[i+1]], inputs)
+RMSE[i+1]     <- sqrt(mean((output[[i+1]][, , 6] - nep)^2, na.rm = TRUE))
+
+cat("RMSE by EKI iteration:", round(RMSE, 4), "\n")
+
+## Select the best parameter set, then run with full IC uncertainty
+params_new        <- param[[which.min(RMSE)]]
+calibrated.ensemble <- SSEM(X.orig, params_new, inputs)
+```
+
+## Updated parameters (prior vs. posterior)
+
+```{r eki-params, fig.asp=1}
+plot_params(params_new, hist.params = params)
+```
+
+---
+
+# 6. Post-calibration assessment
+
+## 6.1 All pools and fluxes
+
+```{r post-forecast}
+plot_forecast(calibrated.ensemble, sample = 5, timestep = ts_per_day)
+```
+
+## 6.2 NEP timeseries
+
+```{r post-nep}
+ci.new <- apply(calibrated.ensemble[, , 6], 1, quantile, c(0.025, 0.5, 0.975))
+
+## Raw timeseries
+ylim <- range(c(range(ci.new), range(nep, na.rm = TRUE)))
+plot(inputs$date, ci.new[2, ], ylim = ylim, col = 1, pch = 18, cex = 0.2,
+     xlab = "Date", ylab = "NEP (umol/m2/s)",
+     main = paste(site_id, year, "— raw timeseries (post-calibration)"))
+ciEnvelope(inputs$date, ci.new[1, ], ci.new[3, ],
+           col = col.alpha("lightGrey", 0.5))
+points(inputs$date, nep, col = nep.qc + 1, cex = 0.02)
+legend("topright", legend = c("model", paste("QC", 0:3)),
+       pch = c(18, rep(1, 4)), col = c(1, 1:4))
+
+## Predicted vs observed
+plot(ci.new[2, ], nep, col = nep.qc + 1, cex = 0.2,
+     xlab = "Model NEP (umol/m2/s)", ylab = "Obs NEP (umol/m2/s)",
+     main = paste(site_id, year, "— predicted vs observed (post-calibration)"))
+abline(0, 1, lty = 2)
+```
+
+## 6.3 Daily timeseries
+
+```{r post-daily}
+daily.calibrated <- apply(calibrated.ensemble[, , 6], 2,
+                          function(x) tapply(x, date_daily, mean, na.rm = TRUE))
+daily.cal.ci <- apply(daily.calibrated, 1, quantile, c(0.025, 0.5, 0.975))
+
+ylim <- range(c(range(daily.orig.ci), range(daily.cal.ci),
+                range(daily.nep, na.rm = TRUE)))
+plot(doy, daily.orig.ci[2, ], ylim = ylim, col = 1, pch = 18, cex = 0.5,
+     xlab = "Date", ylab = "Daily NEP (umol/m2/s)",
+     main = paste(site_id, year, "— daily timeseries (post-calibration)"))
+ciEnvelope(doy, daily.orig.ci[1, ], daily.orig.ci[3, ],
+           col = col.alpha("lightGrey", 0.5))
+points(doy, daily.cal.ci[2, ], col = 4, pch = 18, cex = 0.5)
+ciEnvelope(doy, daily.cal.ci[1, ], daily.cal.ci[3, ],
+           col = col.alpha("lightBlue", 0.5))
+points(doy, daily.nep, col = 2, cex = 0.5)
+legend("topright", legend = c("data", "orig", "calib"),
+       pch = c(1, 18, 18), col = c(2, 1, 4))
+
+## Daily predicted vs observed
+plot(daily.orig.ci[2, ], daily.nep, ylim = ylim, xlim = ylim,
+     xlab = "Model daily NEP", ylab = "Obs daily NEP",
+     main = "Daily predicted vs observed (orig = black, calib = blue)")
+points(daily.cal.ci[2, ], daily.nep, col = 4)
+abline(0, 1, col = 2, lty = 2)
+```
+
+## 6.4 Mean diurnal cycle
+
+```{r post-diurnal}
+cal.diurnal  <- tapply(ci.new[2, ], tod, mean, na.rm = TRUE)
+
+ylim <- range(c(range(cal.diurnal), range(orig.diurnal),
+                range(nep.diurnal, na.rm = TRUE)))
+plot(time.of.day, nep.diurnal, col = 2, ylim = ylim,
+     xlab = "Time of day (s since midnight, UTC-5)",
+     ylab = "NEP (umol/m2/s)",
+     main = paste(site_id, "— mean diurnal cycle (pre vs post calibration)"))
+lines(time.of.day, orig.diurnal)
+lines(time.of.day, cal.diurnal, col = 4)
+legend("topright", legend = c("data", "orig", "calib"),
+       pch = c(1, NA, NA), lty = c(NA, 1, 1), col = c(2, 1, 4))
+```
+
+## 6.5 Skill scores (pre and post)
+
+```{r skill-post}
+qaqc  <- (nep.qc == 0)
+E_new <- ci.new[2, qaqc]
+O     <- nep[qaqc]
+
+NEE.post.fit <- lm(O ~ E_new)
+
+stats["post", "RMSE"]      <- sqrt(mean((E_new - O)^2))
+stats["post", "Bias"]      <- mean(E_new - O)
+stats["post", "cor"]       <- cor(E_new, O)
+stats["post", "slope"]     <- coef(NEE.post.fit)[2]
+stats["post", "R-squared"] <- summary(NEE.post.fit)$r.squared
+
+knitr::kable(stats, digits = 4,
+             caption = paste(site_id, year, "— model skill (pre and post calibration)"))
+```
+
+**Task:**
+
+* How did the model perform after calibration? Did all metrics improve?
+* Are there places where calibration improved the daily mean but made specific
+  hours of the day worse, or vice versa?
+* Does the calibration change your understanding of which processes may be
+  structurally misrepresented?
+
+---
+
+# 7. How does your site compare to regional and global estimates?
+
+The tower calibration gives us a well-constrained model for one site and one year.
+But how does that picture compare to:
+
+* **FLUXCOM** — a machine-learning upscaling of global eddy covariance flux data
+  (Nelson et al. 2024, *Biogeosciences*). FLUXCOM provides monthly GPP, NEE, and
+  energy fluxes at 0.5° resolution from 1980–2021.
+* **CMIP6 Earth system models** — physically-based global climate-carbon cycle
+  models (CESM2, IPSL-CM6A-LR, UKESM1-0-LL). These models simulate terrestrial
+  carbon fluxes from first principles at coarse spatial resolution (~1–2°).
+
+Comparing tower data to these products is informative, but **requires caution**:
+a single tower footprint (~1 km²) is orders of magnitude smaller than a FLUXCOM or
+CMIP6 grid cell (tens of thousands of km²). Heterogeneous land cover, urban areas,
+and disturbance history within a grid cell can make direct comparisons misleading.
+Nevertheless, persistent disagreements between the tower and the global products
+often indicate model biases that matter at large scales.
+
+```{r fluxcom-cmip6}
+## ── Unit conversions ─────────────────────────────────────────────────────────
+## SSEM GPP/NEP: umol CO2 m-2 s-1 (instantaneous rate)
+##   Annual total (gC m-2 yr-1) = sum over timesteps × timestep(s) × 12e-6 gC/umol
+##
+## FLUXCOM CSV (davidjpmoore fork): gC m-2 day-1 (daily means)
+##   Annual total = mean daily rate × 365.25 days yr-1
+##
+## CMIP6 CSV: kg C m-2 s-1 (instantaneous rate)
+##   Annual total = mean monthly rate × 1e3 g/kg × 365.25 × 86400 s/yr
+kgC_to_gC_yr <- 1e3 * 365.25 * 24 * 3600   # kg C m-2 s-1 → gC m-2 yr-1
+d_to_gC_yr   <- 365.25                       # gC m-2 d-1 → gC m-2 yr-1
+
+## ── Derive annual SSEM GPP and NEP ───────────────────────────────────────────
+## SSEM output variable indices: 5 = GPP, 6 = NEP (see SSEM.orig code)
+## sum × timestep(s) × 12e-6 gC/umol converts umol m-2 s-1 to annual gC m-2
+gpp_pre  <- apply(output.ensemble[, , 5],     2, sum) * timestep * 12e-6
+gpp_post <- apply(calibrated.ensemble[, , 5], 2, sum) * timestep * 12e-6
+nep_pre  <- apply(output.ensemble[, , 6],     2, sum) * timestep * 12e-6
+nep_post <- apply(calibrated.ensemble[, , 6], 2, sum) * timestep * 12e-6
+## NEE = -NEP; positive NEE = carbon source (atmospheric sign convention)
+nee_pre  <- -nep_pre
+nee_post <- -nep_post
+
+ssem_annual <- data.frame(
+  source   = c("SSEM pre-cal", "SSEM post-cal"),
+  gpp_gC   = c(median(gpp_pre),  median(gpp_post)),
+  gpp_lo   = c(quantile(gpp_pre,  0.025), quantile(gpp_post,  0.025)),
+  gpp_hi   = c(quantile(gpp_pre,  0.975), quantile(gpp_post,  0.975)),
+  nee_gC   = c(median(nee_pre),  median(nee_post)),
+  nee_lo   = c(quantile(nee_pre,  0.025), quantile(nee_post,  0.025)),
+  nee_hi   = c(quantile(nee_pre,  0.975), quantile(nee_post,  0.975))
+)
+
+## ── Look for FLUXCOM and CMIP6 files ─────────────────────────────────────────
+## CMIP6 filenames use a lower-case dash-free site token (e.g. "US-MMS" → "usmms")
+site_token <- tolower(gsub("-", "", site_id))
+
+fluxcom_path <- file.path("data", "fluxcom",
+                           paste0(site_id, "_fluxcom_monthly.csv"))
+cmip6_paths  <- c(
+  CESM2 = file.path("data", "cmip6", paste0("CESM2_",        site_token, "_monthly.csv")),
+  IPSL  = file.path("data", "cmip6", paste0("IPSL-CM6A-LR_", site_token, "_monthly.csv")),
+  UKESM = file.path("data", "cmip6", paste0("UKESM1-0-LL_",  site_token, "_monthly.csv"))
+)
+
+have_fluxcom <- file.exists(fluxcom_path)
+have_cmip6   <- any(file.exists(cmip6_paths))
+
+if (!have_fluxcom && !have_cmip6) {
+  message("FLUXCOM and CMIP6 data are pre-loaded for US-MMS, US-NR1, DE-Tha, and DK-Sor.",
+          " Open dashboard.html in your browser to explore these comparisons interactively.",
+          " To add your site, contact the course instructors.")
+} else {
+
+  ## ── Load and aggregate FLUXCOM ────────────────────────────────────────────
+  ## FLUXCOM CSV columns: year, month, GPP_gC_m2_d, NEE_gC_m2_d, ET_mm_d, TER_gC_m2_d
+  ## Units are already gC m-2 day-1 (daily means); positive NEE = source.
+  fluxcom_annual <- NULL
+  if (have_fluxcom) {
+    fluxcom_raw <- read_csv(fluxcom_path, comment = "#", show_col_types = FALSE) |>
+      filter(.data$year == .env$year)
+    if (nrow(fluxcom_raw) > 0) {
+      fluxcom_annual <- fluxcom_raw |>
+        summarise(
+          gpp_gC = mean(GPP_gC_m2_d, na.rm = TRUE) * d_to_gC_yr,
+          nee_gC = mean(NEE_gC_m2_d, na.rm = TRUE) * d_to_gC_yr
+        ) |>
+        mutate(source = "FLUXCOM")
+    } else {
+      message("FLUXCOM file found but no rows match year ", year, ".")
+    }
+  }
+
+  ## ── Load and aggregate CMIP6 ──────────────────────────────────────────────
+  ## CMIP6 CSV columns: year, month, gpp_kgC_m2_s, nbp_kgC_m2_s, ...
+  ## nbp (net biome production) ≈ NEP for undisturbed sites; NEE ≈ -nbp.
+  cmip6_annual <- NULL
+  for (model_name in names(cmip6_paths)) {
+    path <- cmip6_paths[model_name]
+    if (!file.exists(path)) next
+    df <- read_csv(path, show_col_types = FALSE) |>
+      filter(.data$year == .env$year)
+    if (nrow(df) == 0) next
+    cmip6_annual <- bind_rows(
+      cmip6_annual,
+      df |>
+        summarise(
+          gpp_gC = mean(gpp_kgC_m2_s, na.rm = TRUE) * kgC_to_gC_yr,
+          nee_gC = -mean(nbp_kgC_m2_s, na.rm = TRUE) * kgC_to_gC_yr
+        ) |>
+        mutate(source = model_name)
+    )
+  }
+
+  ## ── Combine all sources and plot ──────────────────────────────────────────
+  comparison <- bind_rows(ssem_annual, fluxcom_annual, cmip6_annual)
+  comparison$source <- factor(comparison$source,
+                               levels = unique(comparison$source))
+
+  gpp_plot <- ggplot(comparison, aes(x = source, y = gpp_gC, fill = source)) +
+    geom_col(show.legend = FALSE) +
+    geom_errorbar(aes(ymin = gpp_lo, ymax = gpp_hi), width = 0.2, na.rm = TRUE) +
+    labs(title = paste(site_id, year, "— Annual GPP comparison"),
+         x = NULL, y = "GPP (gC m⁻² yr⁻¹)") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  print(gpp_plot)
+
+  nee_plot <- ggplot(comparison, aes(x = source, y = nee_gC, fill = source)) +
+    geom_col(show.legend = FALSE) +
+    geom_errorbar(aes(ymin = nee_lo, ymax = nee_hi), width = 0.2, na.rm = TRUE) +
+    geom_hline(yintercept = 0, lty = 2) +
+    labs(title = paste(site_id, year, "— Annual NEE comparison"),
+         subtitle = "Positive = carbon source; negative = carbon sink",
+         x = NULL, y = "NEE (gC m⁻² yr⁻¹)") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  print(nee_plot)
+
+  cat("\nAnnual GPP and NEE summary (gC m-2 yr-1):\n")
+  print(comparison[, c("source", "gpp_gC", "nee_gC")])
+
+}  ## end if(have_fluxcom || have_cmip6)
+```
+
+**A note on spatial scale.** SSEM is calibrated to a single flux tower footprint
+(roughly 0.5–2 km² depending on wind conditions and canopy height). FLUXCOM and
+CMIP6 grid cells cover 2,500–40,000 km². Within that area there may be roads,
+buildings, different vegetation types, and disturbed patches that are not
+represented by the tower. Agreement between the tower model and global products
+is informative but never expected to be perfect, and disagreements should be
+interpreted carefully before concluding that either is "wrong".
+
+---
+
+# 8. Next steps
+
+Some things you might consider next:
+
+* **Additional data constraints** — sensor-based observations that update
+  frequently work particularly well: MODIS LAI, SMAP soil moisture, automated
+  chamber soil respiration.
+* **Modify or improve the model** — many assumptions in SSEM are known to be
+  false (no water limitation, no phenology, fixed allocation). Which one matters
+  most at your site?
+* **Longer calibration** — do parameters vary by season or by year? Run the
+  exercise for multiple years and compare the calibrated parameter distributions.
+* **Other sites** — the four pre-loaded sites (US-NR1, US-MMS, DE-Tha, DK-Sor)
+  span a range of vegetation types and climates. Find a site that represents your
+  own research ecosystem at <https://fluxnet.org/sites/> and run this Rmd for it.
+
+**Interactive exploration** — open `dashboard.html` in your browser to compare
+SSEM output side-by-side with FLUXNET observations, FLUXCOM upscaling, and CMIP6
+projections for the four pre-loaded sites. No internet connection required.
+
+**To run this Rmd for a different site:**
+
+```r
+rmarkdown::render(
+  "FluxCourseSiteExplorer.Rmd",
+  params = list(site_id = "US-NR1", year = 2015)
+)
+```
+
+Replace `"US-NR1"` with any valid AmeriFlux or ICOS site ID (e.g., `"DE-Tha"`,
+`"DK-Sor"`, `"AU-Tum"`) and set `year` to a year within the site's data record.
+A list of all available sites is at <https://fluxnet.org/sites/>.
+
+---
+
+```{r session-info}
+sessionInfo()
+```
