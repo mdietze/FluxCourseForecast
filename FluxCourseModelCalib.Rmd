@@ -240,9 +240,12 @@ At the half-hourly or hourly resolution, the _QC variable indicates if the corre
 ci = apply(output.ensemble[, ,6], 1, quantile, c(0.025, 0.5, 0.975)) ## forecast confidence interval
                                                                      ## variable 6 = NEP
 ## observations
-nep = -flux$NEE_VUT_REF ## change sign convention
-nep.qc = flux$NEE_VUT_REF_QC
-nep.unc = flux$NEE_VUT_REF_JOINTUNC
+## NEE_REF is created by data/prepare_site.R and holds NEE_VUT_REF where
+## available, or NEE_CUT_REF with a printed note for sites where VUT is
+## not available (e.g. US-NR1 in the AmeriFlux FLUXNET v1.3 product).
+nep     = -flux$NEE_REF
+nep.qc  = flux$NEE_REF_QC
+nep.unc = flux$NEE_REF_JOINTUNC
 
 ## plot raw timeseries
 ylim = range(c(range(ci),range(nep,na.rm=TRUE)))
